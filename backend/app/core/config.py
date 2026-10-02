@@ -15,6 +15,9 @@ class Settings(BaseSettings):
         "DATABASE_URL",
         "postgresql://postgres@postgres:5432/pulsegate",
     )
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
     # JWT authentication
