@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Copy, Check, Trash2, Search } from 'lucide-react';
+import { Plus, Copy, Check, Trash2, Search, Loader2 } from 'lucide-react';
 import { apiKeyService, projectService, formatDateIST, formatDateTimeIST } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { Card, Button, Badge, Modal, Input, EmptyState, LoadingState, ErrorState, ConfirmModal, Toast } from '../components/UIComponents';
@@ -10,17 +10,23 @@ export const ApiKeys = () => {
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  // Filters
   const [searchFilter, setSearchFilter] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [envFilter, setEnvFilter] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
 
-  // Creation & Confirmation States
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchFilter);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchFilter]);
+
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [newKey, setNewKey] = useState({
     project_id: selectedProjectId || '', name: '', environment: 'production',
-    expiration_days: '7', rate_limit_per_minute: '5'
+    expiration_days: '7'
   });
   const [createdRawKey, setCreatedRawKey] = useState('');
   const [copied, setCopied] = useState(false);
@@ -34,14 +40,18 @@ export const ApiKeys = () => {
     setTimeout(() => setToast(null), 3000);
   };
 
-  const fetchData = async () => {
-    setLoading(true);
+  const fetchData = async (isInitial = false) => {
+    if (isInitial) {
+      setLoading(true);
+    } else {
+      setIsSearching(true);
+    }
     setError(null);
     try {
       const filters = {
         project_id: selectedProjectId,
       };
-      if (searchFilter) filters.search = searchFilter;
+      if (debouncedSearch.trim()) filters.search = debouncedSearch.trim();
       if (statusFilter) filters.status = statusFilter;
       if (envFilter) filters.environment = envFilter;
 
@@ -58,12 +68,13 @@ export const ApiKeys = () => {
       setError('Failed to load API keys.');
     } finally {
       setLoading(false);
+      setIsSearching(false);
     }
   };
 
   useEffect(() => {
-    fetchData();
-  }, [selectedProjectId, searchFilter, statusFilter, envFilter]);
+    fetchData(keys.length === 0);
+  }, [selectedProjectId, debouncedSearch, statusFilter, envFilter]);
 
   const getErrorMessage = (err, fallback) => {
     const detail = err.response?.data?.detail;
@@ -82,12 +93,6 @@ export const ApiKeys = () => {
       return;
     }
 
-    const rateLimit = parseInt(newKey.rate_limit_per_minute, 10);
-    if (!rateLimit || rateLimit < 1 || rateLimit > 1000) {
-      showToast('Rate limit must be between 1 and 1000 requests/minute.', 'error');
-      return;
-    }
-
     setSubmitting(true);
     try {
       const payload = {
@@ -95,7 +100,6 @@ export const ApiKeys = () => {
         name: newKey.name.trim(),
         environment: newKey.environment,
         expiration_days: newKey.expiration_days ? Number(newKey.expiration_days) : null,
-        rate_limit_per_minute: rateLimit,
       };
       const res = await apiKeyService.create(payload);
       const rawKey = res?.raw_key ?? res?.data?.raw_key;
@@ -173,7 +177,6 @@ export const ApiKeys = () => {
               name: '',
               environment: 'production',
               expiration_days: '7',
-              rate_limit_per_minute: '5',
             });
             setIsCreateOpen(true);
           }}
@@ -185,15 +188,18 @@ export const ApiKeys = () => {
 
       {/* Search & Filter Bar */}
       <Card className="flex flex-wrap items-center justify-between gap-3 p-3 bg-white">
-        <div className="flex items-center space-x-2 flex-1 max-w-xs">
+        <div className="flex items-center space-x-2 flex-1 max-w-xs relative">
           <Search className="w-4 h-4 text-[#8A969F]" />
           <input
             type="text"
-            placeholder="Search keys by name..."
+            placeholder="Search keys by name"
             value={searchFilter}
             onChange={(e) => setSearchFilter(e.target.value)}
             className="w-full bg-white border border-[#DCE3E8] text-[#17212B] text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-[#159A8A]"
           />
+          {isSearching && (
+            <Loader2 className="w-3.5 h-3.5 text-[#159A8A] animate-spin absolute right-2.5" />
+          )}
         </div>
 
         <div className="flex items-center space-x-2">
@@ -228,7 +234,7 @@ export const ApiKeys = () => {
           onAction={() => { setCreatedRawKey(''); setIsCreateOpen(true); }}
         />
       ) : (
-        <Card className="p-0 overflow-hidden">
+        <Card className={`p-0 overflow-hidden relative transition-opacity duration-200 ${isSearching ? 'opacity-60 pointer-events-none' : 'opacity-100'}`}>
           <table className="w-full text-left text-xs">
             <thead className="bg-[#F9FAFB] border-b border-[#E4E9EE] text-[#687680] font-medium">
               <tr>
@@ -236,7 +242,6 @@ export const ApiKeys = () => {
                 <th className="py-3 px-4">Key Prefix</th>
                 <th className="py-3 px-4">Environment</th>
                 <th className="py-3 px-4">Status</th>
-                <th className="py-3 px-4">Rate Limit</th>
                 <th className="py-3 px-4">Expires</th>
                 <th className="py-3 px-4">Last Used</th>
                 <th className="py-3 px-4 text-right">Actions</th>
@@ -254,9 +259,6 @@ export const ApiKeys = () => {
                     <Badge variant={k.status === 'active' ? 'success' : k.status === 'revoked' ? 'danger' : 'warning'}>
                       {k.status}
                     </Badge>
-                  </td>
-                  <td className="py-3.5 px-4 text-[#34424D] font-medium">
-                    {k.rate_limit_per_minute}/min
                   </td>
                   <td className="py-3.5 px-4 text-[#687680]">
                     {formatDateIST(k.expires_at)}
@@ -328,20 +330,6 @@ export const ApiKeys = () => {
                 <option value="30">Expires in 30 Days</option>
                 <option value="90">Expires in 90 Days</option>
               </select>
-            </div>
-            <div className="space-y-1.5">
-              <label className="block text-xs font-medium text-[#687680]">Rate Limit (requests/minute)</label>
-              <input
-                type="number"
-                min="1"
-                max="1000"
-                value={newKey.rate_limit_per_minute}
-                onChange={(e) => setNewKey({ ...newKey, rate_limit_per_minute: e.target.value })}
-                placeholder="e.g. 60"
-                className="w-full px-3.5 py-2 bg-white border border-[#DCE3E8] rounded-lg text-[#17212B] text-sm focus:outline-none focus:border-[#159A8A]"
-                required
-              />
-              <p className="text-[10px] text-[#8A969F]">How many requests this key can make per minute (1-1000)</p>
             </div>
             <div className="flex justify-end space-x-3 pt-3">
               <Button type="button" variant="secondary" onClick={() => setIsCreateOpen(false)}>

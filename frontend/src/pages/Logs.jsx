@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { RefreshCw, Eye, Search, Code2, Layers, Clock, Globe, Copy, CheckCheck } from 'lucide-react';
+import { RefreshCw, Eye, Search, Code2, Layers, Clock, Globe, Copy, CheckCheck, Loader2 } from 'lucide-react';
 import { logService, formatDateTimeIST } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { Card, Button, Badge, Modal, EmptyState, LoadingState, ErrorState } from '../components/UIComponents';
@@ -13,15 +13,29 @@ export const Logs = () => {
   // Filters
   const [methodFilter, setMethodFilter] = useState('');
   const [statusCategoryFilter, setStatusCategoryFilter] = useState('');
-  const [searchQuery, setSearchQuery] = useState('');
+  const [searchFilter, setSearchFilter] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
+
+  // 300ms debounce timer for live typing auto-search
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchFilter);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchFilter]);
 
   // Log Detail Modal
   const [selectedLog, setSelectedLog] = useState(null);
   const [detailTab, setDetailTab] = useState('overview');
   const [copied, setCopied] = useState(false);
 
-  const fetchLogs = async () => {
-    setLoading(true);
+  const fetchLogs = async (isInitial = false) => {
+    if (isInitial) {
+      setLoading(true);
+    } else {
+      setIsSearching(true);
+    }
     setError(null);
     try {
       const filters = {
@@ -30,7 +44,7 @@ export const Logs = () => {
       };
       if (methodFilter) filters.method = methodFilter;
       if (statusCategoryFilter) filters.status_category = statusCategoryFilter;
-      if (searchQuery.trim()) filters.search = searchQuery.trim();
+      if (debouncedSearch.trim()) filters.search = debouncedSearch.trim();
 
       const logData = await logService.getAll(filters);
       setLogs(logData);
@@ -38,17 +52,13 @@ export const Logs = () => {
       setError('Failed to fetch request logs.');
     } finally {
       setLoading(false);
+      setIsSearching(false);
     }
   };
 
   useEffect(() => {
-    fetchLogs();
-  }, [selectedProjectId, methodFilter, statusCategoryFilter]);
-
-  const handleSearchSubmit = (e) => {
-    e.preventDefault();
-    fetchLogs();
-  };
+    fetchLogs(logs.length === 0);
+  }, [selectedProjectId, methodFilter, statusCategoryFilter, debouncedSearch]);
 
   const getStatusVariant = (code) => {
     if (code >= 200 && code < 300) return 'success';
@@ -114,48 +124,49 @@ export const Logs = () => {
       </div>
 
       {/* Filter Bar */}
-      <Card className="p-3 bg-white">
-        <form onSubmit={handleSearchSubmit} className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center space-x-2 flex-1 min-w-50 max-w-xs">
-            <Search className="w-4 h-4 text-[#8A969F]" />
-            <input
-              type="text"
-              placeholder="Search request ID or endpoint..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full bg-white border border-[#DCE3E8] text-[#17212B] text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-[#159A8A]"
-            />
-          </div>
+      <Card className="flex flex-wrap items-center justify-between gap-3 p-3 bg-white">
+        <div className="flex items-center space-x-2 flex-1 max-w-xs relative">
+          <Search className="w-4 h-4 text-[#8A969F]" />
+          <input
+            type="text"
+            placeholder="Search endpoint"
+            value={searchFilter}
+            onChange={(e) => setSearchFilter(e.target.value)}
+            className="w-full bg-white border border-[#DCE3E8] text-[#17212B] text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-[#159A8A]"
+          />
+          {isSearching && (
+            <Loader2 className="w-3.5 h-3.5 text-[#159A8A] animate-spin absolute right-2.5" />
+          )}
+        </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Method Filter */}
-            <select
-              value={methodFilter}
-              onChange={(e) => setMethodFilter(e.target.value)}
-              className="bg-white border border-[#DCE3E8] text-[#34424D] text-xs rounded-lg px-2.5 py-1.5 focus:outline-none"
-            >
-              <option value="">All Methods</option>
-              <option value="GET">GET</option>
-              <option value="POST">POST</option>
-              <option value="PUT">PUT</option>
-              <option value="PATCH">PATCH</option>
-              <option value="DELETE">DELETE</option>
-            </select>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Method Filter */}
+          <select
+            value={methodFilter}
+            onChange={(e) => setMethodFilter(e.target.value)}
+            className="bg-white border border-[#DCE3E8] text-[#34424D] text-xs rounded-lg px-2.5 py-1.5 focus:outline-none"
+          >
+            <option value="">All Methods</option>
+            <option value="GET">GET</option>
+            <option value="POST">POST</option>
+            <option value="PUT">PUT</option>
+            <option value="PATCH">PATCH</option>
+            <option value="DELETE">DELETE</option>
+          </select>
 
-            {/* Status Category Filter */}
-            <select
-              value={statusCategoryFilter}
-              onChange={(e) => setStatusCategoryFilter(e.target.value)}
-              className="bg-white border border-[#DCE3E8] text-[#34424D] text-xs rounded-lg px-2.5 py-1.5 focus:outline-none"
-            >
-              <option value="">All Statuses</option>
-              <option value="2xx">2xx Success</option>
-              <option value="3xx">3xx Redirect</option>
-              <option value="4xx">4xx Client Error (400, 401, 404, 405, 429)</option>
-              <option value="5xx">5xx Server Error</option>
-            </select>
-          </div>
-        </form>
+          {/* Status Category Filter */}
+          <select
+            value={statusCategoryFilter}
+            onChange={(e) => setStatusCategoryFilter(e.target.value)}
+            className="bg-white border border-[#DCE3E8] text-[#34424D] text-xs rounded-lg px-2.5 py-1.5 focus:outline-none"
+          >
+            <option value="">All Statuses</option>
+            <option value="2xx">2xx Success</option>
+            <option value="3xx">3xx Redirect</option>
+            <option value="4xx">4xx Client Error (400, 401, 404, 405, 429)</option>
+            <option value="5xx">5xx Server Error</option>
+          </select>
+        </div>
       </Card>
 
       {/* Summary Stats Row */}
@@ -204,7 +215,7 @@ export const Logs = () => {
           description="Your API request activity will appear here in real-time as gateway requests are executed."
         />
       ) : (
-        <Card className="p-0 overflow-hidden">
+        <Card className={`p-0 overflow-hidden relative transition-opacity duration-200 ${isSearching ? 'opacity-60 pointer-events-none' : 'opacity-100'}`}>
           <table className="w-full text-left text-xs">
             <thead className="bg-[#F9FAFB] border-b border-[#E4E9EE] text-[#687680] font-medium">
               <tr>

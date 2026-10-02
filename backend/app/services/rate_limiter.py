@@ -6,9 +6,6 @@ from app.core.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
-# Atomic Lua script: increments counter and sets TTL in one round-trip.
-# Returns [current_count, ttl_remaining].
-# If the key is new (TTL == -1 after INCR), sets expiry to the window size.
 RATE_LIMIT_LUA = """
 local key = KEYS[1]
 local window = tonumber(ARGV[1])
@@ -76,10 +73,7 @@ class RateLimitService:
 
     @staticmethod
     def check(api_key_id: str, limit_per_minute: int) -> RateLimitResult:
-        """
-        Atomically increments the request counter for this API key's current
-        minute window and checks against the configured limit.
-        """
+        
         r = get_redis()
         if not r:
             logger.warning("Redis unavailable — using in-memory rate limiting fallback")

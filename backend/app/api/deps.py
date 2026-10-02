@@ -35,12 +35,10 @@ from datetime import datetime
 def validate_gateway_api_key(raw_api_key: str, db: Session) -> tuple[APIKey, Project]:
     """
     Validates customer API key for the Gateway.
-    Checks Redis cache first for cached project config / key validity.
     """
     if not raw_api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key missing")
     
-    # Strip quotes, bearer prefix and surrounding whitespace
     raw_api_key = str(raw_api_key).strip().strip('"').strip("'")
     if raw_api_key.lower().startswith("bearer "):
         raw_api_key = raw_api_key[7:].strip().strip('"').strip("'")
@@ -51,7 +49,6 @@ def validate_gateway_api_key(raw_api_key: str, db: Session) -> tuple[APIKey, Pro
     if not api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key (key not found)")
 
-    # Check expiration
     if api_key.expires_at and api_key.expires_at < datetime.utcnow():
         if api_key.status == "active":
             api_key.status = "expired"
