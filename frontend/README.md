@@ -1,16 +1,46 @@
-# React + Vite
+# 🎨 PulseGate Dashboard Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+This directory contains the React + Vite frontend for **PulseGate**, built to give developers a clean interface to manage projects, create API keys, view live request logs, and test API endpoints interactively.
 
-Currently, two official plugins are available:
+---
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## 🚀 Features
 
-## React Compiler
+- **Analytics Dashboard**: Overview of key metrics, total request counts, success rates, and active keys.
+- **API Key Management**: Create, copy, and revoke hashed API keys instantly.
+- **Live Logs**: Search, filter, and inspect detailed HTTP request logs (method, path, status, latency).
+- **Interactive Playground**: Send test GET/POST requests directly against gateway endpoints to observe rate limits and response codes.
+- **Projects & Settings**: Organization management and profile settings.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+---
 
-## Expanding the Oxlint configuration
+## 🛠️ Getting Started
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+### Installation
+
+```bash
+# Install dependencies
+npm install
+
+# Start the Vite development server
+npm run dev
+```
+
+The frontend will run locally on `http://localhost:3000` (or `http://localhost:5173` if running outside Docker).
+
+### Environment Configuration
+
+Create a `.env` file in this directory if you need to point to a custom backend URL:
+
+```env
+VITE_API_URL=http://localhost:8000
+```
+
+---
+
+## 🏗️ Scripts
+
+- `npm run dev`: Runs the app in development mode with HMR.
+- `npm run build`: Bundles production-ready assets into the `dist/` folder.
+- `npm run preview`: Previews the local production build.
+- `npm run lint`: Runs ESLint / Oxlint rules across source files.
