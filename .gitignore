@@ -1,0 +1,26 @@
+.env
+.env.*
+!.env.example
+
+# Local databases and runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Local tooling and editor files
+.vscode/
+.idea/
+*.log
+
+# Python virtual environment
+venv/
+ENV/
+env/
+
