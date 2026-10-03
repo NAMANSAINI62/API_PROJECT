@@ -5,9 +5,11 @@ import {
   KeyRound, Layers, Code2, Globe
 } from 'lucide-react';
 import { gatewayService, formatTimeIST } from '../services/api';
+import { useAuth } from '../context/AuthContext';
 import { Card, Button, Badge, Input, Toast } from '../components/UIComponents';
 
 export const Playground = () => {
+  const { selectedProjectId } = useAuth();
   const [rawKeyInput, setRawKeyInput] = useState('');
 
   const [method, setMethod] = useState('GET');
@@ -78,6 +80,9 @@ export const Playground = () => {
       });
 
       const hObj = {};
+      if (selectedProjectId) {
+        hObj['X-Project-ID'] = selectedProjectId;
+      }
       customHeaders.forEach(h => {
         if (h.key.trim()) hObj[h.key.trim()] = h.value;
       });

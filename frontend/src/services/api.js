@@ -18,11 +18,13 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Handle 401 errors globally
+// Handle 401 errors globally (only for dashboard/auth endpoints, NOT gateway requests)
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401) {
+    // If the 401 error came from an internal dashboard route (not a gateway test request with X-API-Key), log out
+    const isGatewayRequest = Boolean(error.config?.headers?.['X-API-Key']);
+    if (error.response?.status === 401 && !isGatewayRequest) {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
       window.location.href = '/login';

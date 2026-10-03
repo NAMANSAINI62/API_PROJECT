@@ -95,11 +95,13 @@ export const ApiKeys = () => {
 
     setSubmitting(true);
     try {
+      const expDays = newKey.expiration_days ? Number(newKey.expiration_days) : null;
       const payload = {
         project_id: validProject.id,
         name: newKey.name.trim(),
         environment: newKey.environment,
-        expiration_days: newKey.expiration_days ? Number(newKey.expiration_days) : null,
+        expires_in_days: expDays,
+        expiration_days: expDays,
       };
       const res = await apiKeyService.create(payload);
       const rawKey = res?.raw_key ?? res?.data?.raw_key;
@@ -261,7 +263,7 @@ export const ApiKeys = () => {
                     </Badge>
                   </td>
                   <td className="py-3.5 px-4 text-[#687680]">
-                    {formatDateIST(k.expires_at)}
+                    {k.expires_at ? formatDateIST(k.expires_at) : 'Never'}
                   </td>
                   <td className="py-3.5 px-4 text-[#8A969F]">
                     {formatDateTimeIST(k.last_used_at)}

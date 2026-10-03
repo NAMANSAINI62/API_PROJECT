@@ -60,9 +60,10 @@ def create_api_key(
 
     raw_key, key_prefix, key_hash = generate_api_key(environment=key_in.environment)
 
+    exp_days = key_in.expires_in_days or key_in.expiration_days
     expires_at = None
-    if key_in.expires_in_days:
-        expires_at = datetime.utcnow() + timedelta(days=key_in.expires_in_days)
+    if exp_days:
+        expires_at = datetime.utcnow() + timedelta(days=exp_days)
 
     api_key = APIKey(
         project_id=project.id,

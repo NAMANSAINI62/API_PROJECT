@@ -20,18 +20,22 @@ def get_usage(
 ):
     start_date = datetime.utcnow() - timedelta(days=days)
 
-    where_clauses = [
-        "l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id)",
-        "l.created_at >= :start_date"
-    ]
     params = {
         "user_id": current_user.id,
         "start_date": start_date
     }
 
     if project_id:
-        where_clauses.append("l.project_id = :project_id")
+        where_clauses = [
+            "(l.project_id = :project_id OR l.project_id IS NULL)",
+            "l.created_at >= :start_date"
+        ]
         params["project_id"] = project_id
+    else:
+        where_clauses = [
+            "(l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id) OR l.project_id IS NULL)",
+            "l.created_at >= :start_date"
+        ]
 
     where_sql = " AND ".join(where_clauses)
 

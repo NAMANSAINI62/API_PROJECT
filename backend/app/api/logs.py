@@ -22,9 +22,6 @@ def get_logs(
     db: Session = Depends(get_db)
 ):
     # Dynamic raw PostgreSQL query string building
-    where_clauses = [
-        "l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id)"
-    ]
     params = {
         "user_id": current_user.id,
         "limit": limit,
@@ -32,8 +29,14 @@ def get_logs(
     }
 
     if project_id:
-        where_clauses.append("l.project_id = :project_id")
+        where_clauses = [
+            "(l.project_id = :project_id OR l.project_id IS NULL)"
+        ]
         params["project_id"] = project_id
+    else:
+        where_clauses = [
+            "(l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id) OR l.project_id IS NULL)"
+        ]
 
     if status_code:
         where_clauses.append("l.status_code = :status_code")
@@ -65,6 +68,7 @@ def get_logs(
             l.id,
             l.request_id,
             l.project_id,
+            l.api_key_id,
             l.method,
             l.endpoint,
             l.status_code,
@@ -74,7 +78,6 @@ def get_logs(
             l.response_body,
             l.created_at
         FROM api_request_logs l
-        LEFT OUTER JOIN projects p ON l.project_id = p.id
         WHERE {where_sql}
         ORDER BY l.created_at DESC
         LIMIT :limit OFFSET :offset

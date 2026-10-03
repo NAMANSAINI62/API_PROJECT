@@ -60,6 +60,7 @@ class APIKeyCreate(BaseModel):
     environment: Optional[str] = "production"
     rate_limit_per_minute: Optional[int] = Field(default=5, ge=1, le=1000)
     expires_in_days: Optional[int] = None
+    expiration_days: Optional[int] = None
 
 class APIKeyResponse(BaseModel):
     id: str
@@ -99,14 +100,14 @@ class APIRequestLogResponse(BaseModel):
 
 class LogResponse(BaseModel):
     id: str
+    request_id: Optional[str] = None
     project_id: Optional[str] = None
-    project_name: Optional[str] = None
+    api_key_id: Optional[str] = None
     method: str
     endpoint: str
     status_code: int
-    ip_address: Optional[str] = None
-    user_agent: Optional[str] = None
     latency_ms: Optional[float] = 0.0
+    request_headers: Optional[str] = None
     request_body: Optional[str] = None
     response_body: Optional[str] = None
     created_at: str

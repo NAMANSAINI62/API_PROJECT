@@ -6,11 +6,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-
+from jose import jwt
+from app.core.config import settings
 from app.core.database import get_db
 from app.api.deps import validate_gateway_api_key
 from app.services.rate_limiter import RateLimitService
-from app.models.all_models import APIRequestLog, APIKey, TestUser
+from app.models.all_models import APIRequestLog, APIKey, TestUser, Project
 from app.core.security import hash_api_key
 
 router = APIRouter()
@@ -121,14 +122,7 @@ async def gateway_test_users_dispatcher(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db)
 ):
-    """
-    Real API Gateway Proxy Endpoint.
-    Validates API key (existence, hash, status, expiration, revocation),
-    Enforces Redis per-API-key rate limiting,
-    Executes real database CRUD operations for GET, POST, PUT, PATCH, DELETE,
-    Measures exact backend latency, assigns X-Request-ID,
-    and logs every request to PostgreSQL.
-    """
+
     start_time = time.time()
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     method = request.method.upper()
@@ -150,6 +144,25 @@ async def gateway_test_users_dispatcher(
             if existing_key:
                 key_id = existing_key.id
                 project_id = existing_key.project_id
+
+        if not project_id:
+            hdr_proj = request.headers.get("x-project-id") or request.query_params.get("project_id")
+            if hdr_proj:
+                proj = db.query(Project).filter(Project.id == hdr_proj).first()
+                if proj:
+                    project_id = proj.id
+
+        if not project_id and authorization and authorization.lower().startswith("bearer "):
+            try:
+                token = authorization[7:].strip()
+                payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+                uid = payload.get("sub")
+                if uid:
+                    u_proj = db.query(Project).filter(Project.user_id == uid).first()
+                    if u_proj:
+                        project_id = u_proj.id
+            except Exception:
+                pass
 
         # Capture payload details for full audit trail
         req_headers_json = _safe_json(_sanitize_headers(request))
