@@ -15,11 +15,6 @@ class Settings(BaseSettings):
         "DATABASE_URL",
         "postgresql://postgres@postgres:5432/pulsegate",
     )
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
-    elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
-        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
-
 
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
@@ -42,6 +37,12 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+if settings.DATABASE_URL.startswith("postgres://"):
+    settings.DATABASE_URL = settings.DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif settings.DATABASE_URL.startswith("postgresql://") and not settings.DATABASE_URL.startswith("postgresql+"):
+    settings.DATABASE_URL = settings.DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
 
 # Build service URLs from separate credentials so passwords containing URL
 # characters such as "@", ":" or "/" remain valid connection credentials.
