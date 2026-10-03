@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useNavigate, Link, useLocation } from 'react-router-dom';
 import { ShieldCheck } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { authService } from '../services/api';
@@ -12,6 +12,8 @@ export const Login = () => {
   const [loading, setLoading] = useState(false);
   const { loginUser } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+  const successMessage = location.state?.message;
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -41,12 +43,18 @@ export const Login = () => {
 
         <Card className="shadow-xs border-[#E1E7EB]">
           <form onSubmit={handleSubmit} className="space-y-4">
+            {successMessage && (
+              <div className="p-3 bg-[#E8F8F5] border border-[#159A8A]/30 rounded-lg text-xs text-[#118274] font-medium">
+                {successMessage}
+              </div>
+            )}
             {error && (
               <div className="p-3 bg-[#FDEEEE] border border-[#E05B5B]/30 rounded-lg text-xs text-[#B63F3F]">
                 {error}
               </div>
             )}
             <Input
+
               label="Email"
               type="email"
               placeholder="name@company.com"
@@ -93,9 +101,8 @@ export const Register = () => {
     setError('');
     setLoading(true);
     try {
-      const data = await authService.register(name, email, password);
-      loginUser(data);
-      navigate('/overview');
+      await authService.register(name, email, password);
+      navigate('/login', { state: { message: 'Account created successfully! Please sign in.' } });
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to create account.');
     } finally {
