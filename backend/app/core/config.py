@@ -43,6 +43,14 @@ if settings.DATABASE_URL.startswith("postgres://"):
 elif settings.DATABASE_URL.startswith("postgresql://") and not settings.DATABASE_URL.startswith("postgresql+"):
     settings.DATABASE_URL = settings.DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
+# Auto-fix direct Supabase hostname to pooler host for IPv4 compatibility on Render
+if "db.lhcddocbhsefqgpiqmgs.supabase.co" in settings.DATABASE_URL:
+    settings.DATABASE_URL = (
+        settings.DATABASE_URL.replace("db.lhcddocbhsefqgpiqmgs.supabase.co:5432", "aws-0-ap-south-1.pooler.supabase.com:6543")
+        .replace("//postgres:", "//postgres.lhcddocbhsefqgpiqmgs:")
+    )
+
+
 
 # Build service URLs from separate credentials so passwords containing URL
 # characters such as "@", ":" or "/" remain valid connection credentials.
