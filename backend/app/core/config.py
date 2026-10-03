@@ -16,7 +16,10 @@ class Settings(BaseSettings):
         "postgresql://postgres@postgres:5432/pulsegate",
     )
     if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
 
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
