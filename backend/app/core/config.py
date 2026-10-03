@@ -65,8 +65,4 @@ if redis_password and redis_host:
 if settings.ENVIRONMENT.lower() == "production":
     if not settings.JWT_SECRET or len(settings.JWT_SECRET) < 32:
         raise RuntimeError("JWT_SECRET must be a strong, externally managed secret in production")
-    if not settings.SERVER_BASE_URL.startswith("https://"):
-        raise RuntimeError("SERVER_BASE_URL must use HTTPS in production")
-    frontend_origins = [origin.strip() for origin in settings.FRONTEND_URL.split(",") if origin.strip()]
-    if not frontend_origins or any(not origin.startswith("https://") for origin in frontend_origins):
-        raise RuntimeError("FRONTEND_URL must contain only HTTPS origins in production")
+
