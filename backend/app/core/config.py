@@ -44,8 +44,6 @@ elif settings.DATABASE_URL.startswith("postgresql://") and not settings.DATABASE
     settings.DATABASE_URL = settings.DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 
-
-
 # Build service URLs from separate credentials so passwords containing URL
 # characters such as "@", ":" or "/" remain valid connection credentials.
 postgres_password = os.getenv("POSTGRES_PASSWORD")
