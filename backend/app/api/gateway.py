@@ -13,8 +13,10 @@ from app.api.deps import validate_gateway_api_key
 from app.services.rate_limiter import RateLimitService
 from app.models.all_models import APIRequestLog, APIKey, TestUser, Project
 from app.core.security import hash_api_key
+from app.core.limiter import limiter
 
 router = APIRouter()
+
 
 
 def _create_log(
@@ -114,7 +116,9 @@ def _sanitize_headers(request: Request) -> dict:
 @router.api_route("/test/users", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 @router.api_route("/test/users/{user_id}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 @router.get("/test/status/{status_code}")
+@limiter.limit("5/minute")
 async def gateway_test_users_dispatcher(
+
     request: Request,
     user_id: Optional[int] = None,
     status_code: Optional[int] = None,
