@@ -191,7 +191,7 @@ export const Playground = () => {
       return;
     }
     if (!isValidRawKeyFormat(activeKey)) {
-      showToast('That doesn\'t look like a full raw API key (expected pk_live_... / pk_test_...)', 'error');
+      showToast('That does not look like a full raw API key', 'error');
       return;
     }
 

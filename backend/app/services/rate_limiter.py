@@ -33,7 +33,7 @@ _fallback_cache = {}
 
 class RateLimitService:
     """
-    Fixed-window rate limiter using Redis, isolated per API key.
+    Fixed-window rate limiter using Atomic Lua Script on Redis, isolated per API key.
     Redis key format: ratelimit:{api_key_id}:{window_start}
     """
 
@@ -45,7 +45,7 @@ class RateLimitService:
         current_window = int(time.time() // RateLimitService.WINDOW_SECONDS)
         redis_key = f"ratelimit:{api_key_id}:{current_window}"
         
-        # Cleanup old windows (simple garbage collection)
+        # Cleanup old windows
         now = time.time()
         keys_to_delete = []
         for k, v in _fallback_cache.items():
@@ -73,7 +73,6 @@ class RateLimitService:
 
     @staticmethod
     def check(api_key_id: str, limit_per_minute: int) -> RateLimitResult:
-        
         r = get_redis()
         if not r:
             logger.warning("Redis unavailable — using in-memory rate limiting fallback")
