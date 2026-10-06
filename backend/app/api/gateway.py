@@ -3,10 +3,13 @@ import uuid
 import json
 from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from jose import jwt
+
 from app.core.config import settings
 from app.core.database import get_db
 from app.api.deps import validate_gateway_api_key
@@ -17,20 +20,106 @@ from app.core.security import hash_api_key
 router = APIRouter()
 
 
-def _create_log(
-    db: Session,
-    request_id: str,
-    project_id: Optional[str],
-    api_key_id: Optional[str],
-    method: str,
-    endpoint: str,
-    status_code: int,
-    latency_ms: float,
-    request_headers: Optional[str] = None,
-    request_body: Optional[str] = None,
-    response_body: Optional[str] = None,
-) -> None:
-    """Create an API request log entry in PostgreSQL with optional request/response payloads."""
+# ---------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------
+
+# Values of these keys are never saved in logs
+SECRET_WORDS = [
+    "authorization", "cookie", "set-cookie", "password", "password_hash",
+    "token", "access_token", "refresh_token", "api_key", "raw_key", "secret",
+]
+
+# Only these request headers are saved in logs
+SAFE_HEADERS = [
+    "accept", "content-type", "user-agent", "x-request-id",
+    "x-forwarded-for", "x-forwarded-proto",
+]
+
+
+# ---------------------------------------------------------------
+# 1. Small helper functions
+# ---------------------------------------------------------------
+
+def make_request_id():
+    """Create a unique id like 'req_a1b2c3d4e5f6'."""
+    return "req_" + uuid.uuid4().hex[:12]
+
+
+def get_api_key_from_headers(x_api_key, authorization):
+    """Read the key from X-API-Key or from 'Authorization: Bearer <key>'."""
+    if x_api_key and x_api_key.strip():
+        return x_api_key.strip()
+
+    if authorization and authorization.strip():
+        text = authorization.strip()
+        if text.lower().startswith("bearer "):
+            return text[7:].strip()
+        return text
+
+    return ""
+
+
+def hide_secrets(data):
+    """Replace secret values with [REDACTED] (also inside nested data)."""
+    if isinstance(data, dict):
+        result = {}
+        for key, value in data.items():
+            if str(key).lower() in SECRET_WORDS:
+                result[key] = "[REDACTED]"
+            else:
+                result[key] = hide_secrets(value)
+        return result
+
+    if isinstance(data, list):
+        return [hide_secrets(item) for item in data]
+
+    return data
+
+
+def to_json(data):
+    """Convert data to a JSON string for the log (secrets hidden, max 10KB)."""
+    if data is None:
+        return None
+
+    try:
+        text = json.dumps(hide_secrets(data), default=str)
+    except Exception:
+        return None
+
+    return text[:10240]
+
+
+def get_safe_headers(request: Request):
+    """Return only the harmless headers from the request."""
+    result = {}
+    for key, value in request.headers.items():
+        if key.lower() in SAFE_HEADERS:
+            result[key] = value
+    return result
+
+
+def user_to_dict(user):
+    """Turn a TestUser database object into a normal dictionary."""
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+        "created_at": user.created_at.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------
+# 2. Logging
+# ---------------------------------------------------------------
+
+def save_log(db, request_id, project_id, api_key_id, method, endpoint,
+             status_code, start_time,
+             request_headers=None, request_body=None, response_body=None):
+    """Save one row in the api request log table."""
+    latency_ms = (time.time() - start_time) * 1000
+
     log = APIRequestLog(
         request_id=request_id,
         project_id=project_id,
@@ -39,359 +128,559 @@ def _create_log(
         endpoint=endpoint,
         status_code=status_code,
         latency_ms=round(latency_ms, 2),
-        request_headers=request_headers,
-        request_body=request_body,
-        response_body=response_body,
+        request_headers=to_json(request_headers),
+        request_body=to_json(request_body),
+        response_body=to_json(response_body),
     )
     db.add(log)
     db.commit()
 
 
+# ---------------------------------------------------------------
+# 3. Failed authentication: find key id and project id for the log
+# ---------------------------------------------------------------
 
-def _rate_limit_headers(rl_result, request_id: str) -> dict:
-    """Build standard Gateway headers including X-Request-ID and rate limits."""
+def find_ids_for_failed_auth(request, db, raw_key, authorization):
+    """
+    The key was rejected, but we still try to find which key / project
+    it belongs to, so the failed attempt can be logged properly.
+    Returns (key_id, project_id).
+    """
+    key_id = None
+    project_id = None
+
+    # Try 1: find the key by its hash
+    if raw_key:
+        key_hash = hash_api_key(raw_key)
+        found_key = db.query(APIKey).filter(APIKey.key_hash == key_hash).first()
+        if found_key:
+            key_id = found_key.id
+            project_id = found_key.project_id
+
+    # Try 2: project id sent in header or query string
+    if not project_id:
+        project_hint = request.headers.get("x-project-id") or request.query_params.get("project_id")
+        if project_hint:
+            found_project = db.query(Project).filter(Project.id == project_hint).first()
+            if found_project:
+                project_id = found_project.id
+
+    # Try 3: the Bearer value may be a JWT login token
+    if not project_id and authorization and authorization.lower().startswith("bearer "):
+        try:
+            token = authorization[7:].strip()
+            payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+            user_id = payload.get("sub")
+            if user_id:
+                user_project = db.query(Project).filter(Project.user_id == user_id).first()
+                if user_project:
+                    project_id = user_project.id
+        except Exception:
+            pass
+
+    return key_id, project_id
+
+
+# ---------------------------------------------------------------
+# 4. Rate limit headers
+# ---------------------------------------------------------------
+
+def make_headers(request_id, rl):
+    """Headers that go in every response."""
+    remaining = rl.limit - rl.current_count
+    if remaining < 0:
+        remaining = 0
+
     return {
         "X-Request-ID": request_id,
-        "X-RateLimit-Limit": str(rl_result.limit),
-        "X-RateLimit-Remaining": str(max(0, rl_result.limit - rl_result.current_count)),
-        "X-RateLimit-Reset": str(rl_result.ttl_remaining),
+        "X-RateLimit-Limit": str(rl.limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(rl.ttl_remaining),
     }
 
 
-def _extract_auth_key(request: Request, x_api_key: Optional[str], authorization: Optional[str]) -> str:
-    """Extract raw key from X-API-Key or Authorization header."""
-    if x_api_key and x_api_key.strip():
-        return x_api_key.strip()
-    if authorization and authorization.strip():
-        raw = authorization.strip()
-        if raw.lower().startswith("bearer "):
-            return raw[7:].strip()
-        return raw
-    return ""
+# ---------------------------------------------------------------
+# 5. Status test (fake 3xx / 5xx responses)  -- SAME AS BEFORE
+# ---------------------------------------------------------------
+
+def handle_status_test(status_code):
+    """Return a fake redirect or server-error response."""
+    is_redirect = 300 <= status_code < 400
+    is_server_error = 500 <= status_code < 600
+
+    if not is_redirect and not is_server_error:
+        return 400, {"detail": "Status test only supports 3xx and 5xx codes"}
+
+    if is_redirect:
+        message = "Gateway redirect response"
+    else:
+        message = "Gateway upstream server error response"
+
+    return status_code, {
+        "status": "simulated",
+        "status_code": status_code,
+        "message": message,
+    }
 
 
-_SENSITIVE_KEYS = {
-    "authorization", "cookie", "set-cookie", "password", "password_hash",
-    "token", "access_token", "refresh_token", "api_key", "raw_key", "secret",
-}
+# ---------------------------------------------------------------
+# 6. Reading the request body
+# ---------------------------------------------------------------
 
+async def read_json_body(request: Request, method: str):
+    """
+    Returns (body, is_valid).
+    Only POST / PUT / PATCH have a body.
+    """
+    if method not in ["POST", "PUT", "PATCH"]:
+        return {}, True
 
-def _redact_sensitive_data(data):
-    if isinstance(data, dict):
-        return {
-            key: "[REDACTED]" if str(key).lower() in _SENSITIVE_KEYS else _redact_sensitive_data(value)
-            for key, value in data.items()
-        }
-    if isinstance(data, list):
-        return [_redact_sensitive_data(value) for value in data]
-    return data
-
-
-def _safe_json(data) -> Optional[str]:
-    """Safely serialize data to a JSON string, truncated to 10KB max."""
-    if data is None:
-        return None
     try:
-        s = json.dumps(_redact_sensitive_data(data), default=str)
-        return s[:10240] if len(s) > 10240 else s
+        raw_body = await request.body()
+        if raw_body:
+            return json.loads(raw_body.decode("utf-8")), True
+        return {}, True
     except Exception:
-        return None
+        return {}, False
 
 
-def _sanitize_headers(request: Request) -> dict:
-    """Log only non-sensitive headers needed for request diagnostics."""
-    safe_headers = {
-        "accept", "content-type", "user-agent", "x-request-id",
-        "x-forwarded-for", "x-forwarded-proto",
+# ---------------------------------------------------------------
+# 7. User functions (each returns: status_code, content)
+# ---------------------------------------------------------------
+
+def list_users(db, project):
+    users = db.query(TestUser).filter(TestUser.project_id == project.id).all()
+
+    user_list = []
+    for u in users:
+        user_list.append(user_to_dict(u))
+
+    return 200, {"status": "success", "total": len(user_list), "data": user_list}
+
+
+def create_user(db, project, body):
+    name = str(body.get("name") or body.get("product") or body.get("title") or f"Resource_{uuid.uuid4().hex[:6]}")
+    email = str(body.get("email") or f"user_{uuid.uuid4().hex[:6]}@example.com")
+    role = str(body.get("role") or "developer")
+
+    new_user = TestUser(project_id=project.id, name=name, email=email, role=role)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    response_data = {"id": new_user.id}
+    if isinstance(body, dict) and body:
+        response_data.update(body)
+    else:
+        response_data.update(user_to_dict(new_user))
+
+    if "created_at" not in response_data:
+        response_data["created_at"] = new_user.created_at.isoformat()
+
+    return 201, {
+        "status": "created",
+        "message": "Resource created successfully",
+        "data": response_data,
     }
-    headers = {}
-    for key, value in request.headers.items():
-        lower_key = key.lower()
-        if lower_key in safe_headers:
-            headers[key] = value
-    return headers
 
-@router.api_route("/test/users", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-@router.api_route("/test/users/{user_id}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-@router.get("/test/status/{status_code}")
-async def gateway_test_users_dispatcher(
-    request: Request,
-    user_id: Optional[int] = None,
-    status_code: Optional[int] = None,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db)
-):
 
-    start_time = time.time()
-    request_id = f"req_{uuid.uuid4().hex[:12]}"
+def find_user(db, project, user_id):
+    """Find one user of this project. Returns None if not found."""
+    return db.query(TestUser).filter(
+        TestUser.id == user_id,
+        TestUser.project_id == project.id,
+    ).first()
+
+
+def get_user(db, project, user_id):
+    user = find_user(db, project, user_id)
+    if user is None:
+        return 404, {"detail": f"Resource with ID {user_id} not found in project"}
+
+    return 200, {"status": "success", "data": user_to_dict(user)}
+
+
+def replace_user(db, project, user_id, body):
+    """PUT: replaces or updates resource fields."""
+    user = find_user(db, project, user_id)
+    if user is None:
+        return 404, {"detail": f"Resource with ID {user_id} not found in project"}
+
+    if "name" in body:
+        user.name = str(body["name"])
+    if "email" in body:
+        user.email = str(body["email"])
+    if "role" in body:
+        user.role = str(body["role"])
+
+    db.commit()
+    db.refresh(user)
+
+    response_data = {"id": user.id}
+    if isinstance(body, dict) and body:
+        response_data.update(body)
+    else:
+        response_data.update(user_to_dict(user))
+
+    return 200, {
+        "status": "success",
+        "message": "Resource updated successfully",
+        "data": response_data,
+    }
+
+
+def update_user(db, project, user_id, body):
+    """PATCH: only the sent fields are changed."""
+    user = find_user(db, project, user_id)
+    if user is None:
+        return 404, {"detail": f"Resource with ID {user_id} not found in project"}
+
+    if "name" in body:
+        user.name = str(body["name"])
+    if "email" in body:
+        user.email = str(body["email"])
+    if "role" in body:
+        user.role = str(body["role"])
+
+    db.commit()
+    db.refresh(user)
+
+    response_data = {"id": user.id}
+    if isinstance(body, dict) and body:
+        response_data.update(body)
+    else:
+        response_data.update(user_to_dict(user))
+
+    return 200, {
+        "status": "success",
+        "message": "Resource partially updated successfully",
+        "data": response_data,
+    }
+
+
+def delete_user(db, project, user_id):
+    user = find_user(db, project, user_id)
+    if user is None:
+        return 404, {"detail": f"User with ID {user_id} not found in project"}
+
+    db.delete(user)
+    db.commit()
+    return 204, None
+
+
+# ---------------------------------------------------------------
+# 8. Shared helper 1: runs BEFORE every route (key check + rate limit)
+# ---------------------------------------------------------------
+
+def check_access(request, db, x_api_key, authorization, request_id, start_time):
+    """
+    Returns 4 things: (error_response, api_key, project, headers)
+    - If something is wrong, error_response has the response to send back.
+    - If all is fine, error_response is None.
+    """
     method = request.method.upper()
     endpoint = request.url.path.replace("/api/v1", "")
+    request_headers = get_safe_headers(request)
+    raw_key = get_api_key_from_headers(x_api_key, authorization)
 
-    raw_key = _extract_auth_key(request, x_api_key, authorization)
-
-    # --- Step 1: Validate API Key ---
+    # Step 1: check the API key
     try:
         api_key, project = validate_gateway_api_key(raw_key, db)
     except HTTPException as e:
-        latency = (time.time() - start_time) * 1000
-        key_id = None
-        project_id = None
+        key_id, project_id = find_ids_for_failed_auth(request, db, raw_key, authorization)
 
-        if raw_key:
-            key_hash = hash_api_key(raw_key)
-            existing_key = db.query(APIKey).filter(APIKey.key_hash == key_hash).first()
-            if existing_key:
-                key_id = existing_key.id
-                project_id = existing_key.project_id
+        save_log(db, request_id, project_id, key_id, method, endpoint,
+                 e.status_code, start_time,
+                 request_headers=request_headers,
+                 response_body={"detail": e.detail})
 
-        if not project_id:
-            hdr_proj = request.headers.get("x-project-id") or request.query_params.get("project_id")
-            if hdr_proj:
-                proj = db.query(Project).filter(Project.id == hdr_proj).first()
-                if proj:
-                    project_id = proj.id
+        error = JSONResponse(status_code=e.status_code,
+                             content={"detail": e.detail},
+                             headers={"X-Request-ID": request_id})
+        return error, None, None, None
 
-        if not project_id and authorization and authorization.lower().startswith("bearer "):
-            try:
-                token = authorization[7:].strip()
-                payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-                uid = payload.get("sub")
-                if uid:
-                    u_proj = db.query(Project).filter(Project.user_id == uid).first()
-                    if u_proj:
-                        project_id = u_proj.id
-            except Exception:
-                pass
-
-        # Capture payload details for full audit trail
-        req_headers_json = _safe_json(_sanitize_headers(request))
-        res_body_json = _safe_json({"detail": e.detail})
-
-        # Always log the attempt with full headers and error body
-        _create_log(
-            db, request_id, project_id, key_id, method, endpoint, e.status_code, latency,
-            request_headers=req_headers_json,
-            response_body=res_body_json
-        )
-
-        return JSONResponse(
-            status_code=e.status_code,
-            content={"detail": e.detail},
-            headers={"X-Request-ID": request_id}
-        )
-
-    # --- Step 2: Update last_used_at ---
+    # Step 2: remember when the key was last used
     api_key.last_used_at = datetime.utcnow()
     db.commit()
 
-    # --- Step 3: Per-API-Key Redis Rate Limiting ---
+    # Step 3: rate limit
     rl = RateLimitService.check(
         api_key_id=api_key.id,
-        limit_per_minute=api_key.rate_limit_per_minute
+        limit_per_minute=api_key.rate_limit_per_minute,
     )
+    headers = make_headers(request_id, rl)
 
     if rl.is_limited:
-        latency = (time.time() - start_time) * 1000
-        _create_log(db, request_id, project.id, api_key.id, method, endpoint, 429, latency)
-
-        headers = _rate_limit_headers(rl, request_id)
         headers["Retry-After"] = str(rl.ttl_remaining)
-        return JSONResponse(
-            status_code=429,
-            content={
-                "detail": f"Rate limit exceeded. Limit: {rl.limit} req/min. Current window usage: {rl.current_count}/{rl.limit}."
-            },
-            headers=headers
-        )
-
-    rl_headers = _rate_limit_headers(rl, request_id)
-
-    # Controlled status endpoints make redirect and upstream-error handling
-    # observable without creating hidden failures in normal CRUD routes.
-    if status_code is not None:
-        if not (300 <= status_code < 400 or 500 <= status_code < 600):
-            latency = (time.time() - start_time) * 1000
-            _create_log(db, request_id, project.id, api_key.id, method, endpoint, 400, latency)
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Status test only supports 3xx and 5xx codes"},
-                headers=rl_headers,
-            )
-        latency = (time.time() - start_time) * 1000
-        response_content = {
-            "status": "simulated",
-            "status_code": status_code,
-            "message": (
-                "Gateway redirect response"
-                if status_code < 400
-                else "Gateway upstream server error response"
-            ),
+        content = {
+            "detail": f"Rate limit exceeded. Limit: {rl.limit} req/min. "
+                      f"Current window usage: {rl.current_count}/{rl.limit}."
         }
-        _create_log(
-            db, request_id, project.id, api_key.id, method, endpoint, status_code, latency,
-            request_headers=_safe_json(_sanitize_headers(request)),
-            response_body=_safe_json(response_content),
-        )
-        return JSONResponse(
-            status_code=status_code,
-            content=response_content,
-            headers={**rl_headers, "X-Gateway-Status-Test": str(status_code)},
-        )
+        save_log(db, request_id, project.id, api_key.id, method, endpoint,
+                 429, start_time, request_headers=request_headers, response_body=content)
+        error = JSONResponse(status_code=429, content=content, headers=headers)
+        return error, None, None, None
 
-    # --- Step 4: Parse Request Body (if any) ---
-    body_data = {}
-    if method in ["POST", "PUT", "PATCH"]:
-        try:
-            raw_body = await request.body()
-            if raw_body:
-                body_data = json.loads(raw_body.decode("utf-8"))
-        except Exception:
-            latency = (time.time() - start_time) * 1000
-            _create_log(db, request_id, project.id, api_key.id, method, endpoint, 400, latency)
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Invalid JSON body format"},
-                headers=rl_headers
-            )
+    return None, api_key, project, headers
 
-    # --- Step 5: Route & Execute Real Logic ---
-    res_status = 200
-    res_content = None
 
-    if user_id is None:
-        # Collection routes: /test/users
-        if method == "GET":
-            users = db.query(TestUser).filter(TestUser.project_id == project.id).all()
-            res_status = 200
-            res_content = {
-                "status": "success",
-                "total": len(users),
-                "data": [{"id": u.id, "name": u.name, "email": u.email, "role": u.role, "created_at": u.created_at.isoformat()} for u in users]
-            }
+# ---------------------------------------------------------------
+# 9. Shared helper 2: runs AFTER every route (log + send response)
+# ---------------------------------------------------------------
 
-        elif method == "POST":
-            name = body_data.get("name")
-            email = body_data.get("email")
-            if not name or not email:
-                latency = (time.time() - start_time) * 1000
-                _create_log(db, request_id, project.id, api_key.id, method, endpoint, 400, latency)
-                return JSONResponse(
-                    status_code=400,
-                    content={"detail": "Fields 'name' and 'email' are required for creating a user"},
-                    headers=rl_headers
-                )
-            role = body_data.get("role", "developer")
-            new_u = TestUser(project_id=project.id, name=name, email=email, role=role)
-            db.add(new_u)
-            db.commit()
-            db.refresh(new_u)
-            res_status = 201
-            res_content = {
-                "status": "created",
-                "message": "User created successfully",
-                "data": {"id": new_u.id, "name": new_u.name, "email": new_u.email, "role": new_u.role, "created_at": new_u.created_at.isoformat()}
-            }
+def finish_request(request, db, request_id, start_time, api_key, project,
+                   headers, code, content, body=None):
+    method = request.method.upper()
+    endpoint = request.url.path.replace("/api/v1", "")
 
-        elif method in ["PUT", "PATCH", "DELETE"]:
-            latency = (time.time() - start_time) * 1000
-            _create_log(db, request_id, project.id, api_key.id, method, endpoint, 405, latency)
-            return JSONResponse(
-                status_code=405,
-                content={"detail": f"Method {method} not allowed on collection endpoint '/test/users'. Use '/test/users/{{id}}'."},
-                headers=rl_headers
-            )
+    save_log(db, request_id, project.id, api_key.id, method, endpoint, code, start_time,
+             request_headers=get_safe_headers(request),
+             request_body=body if body else None,
+             response_body=content)
 
+    if code == 204:
+        return Response(status_code=204, headers=headers)
+
+    return JSONResponse(status_code=code, content=content, headers=headers)
+
+
+# ---------------------------------------------------------------
+# 10. Shared helper 3: catches REAL errors and turns them into 500 / 503
+# ---------------------------------------------------------------
+
+def run_safely(db, function, *args):
+    try:
+        return function(*args)
+    except OperationalError:
+        # database is down or unreachable
+        db.rollback()
+        return 503, {"detail": "Database unavailable"}
+    except Exception as error:
+        # any unexpected bug in our code
+        db.rollback()
+        print("Unexpected error:", error)
+        return 500, {"detail": "Internal server error"}
+
+
+# ---------------------------------------------------------------
+# 11. Routes: one function per job
+# ---------------------------------------------------------------
+
+@router.get("/test/users")
+async def list_users_route(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code, content = run_safely(db, list_users, db, project)
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
+
+
+@router.post("/test/users")
+async def create_user_route(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    body, body_is_valid = await read_json_body(request, "POST")
+    if body_is_valid:
+        code, content = run_safely(db, create_user, db, project, body)
     else:
-        # Item routes: /test/users/{user_id}
-        if method == "POST":
-            latency = (time.time() - start_time) * 1000
-            _create_log(db, request_id, project.id, api_key.id, method, endpoint, 405, latency)
-            return JSONResponse(
-                status_code=405,
-                content={"detail": "Method POST not allowed on item endpoint '/test/users/{id}'. Use '/test/users'."},
-                headers=rl_headers
-            )
+        code, content = 400, {"detail": "Invalid JSON body format"}
 
-        u_obj = db.query(TestUser).filter(TestUser.id == user_id, TestUser.project_id == project.id).first()
-        if not u_obj:
-            latency = (time.time() - start_time) * 1000
-            _create_log(db, request_id, project.id, api_key.id, method, endpoint, 404, latency)
-            return JSONResponse(
-                status_code=404,
-                content={"detail": f"User with ID {user_id} not found in project"},
-                headers=rl_headers
-            )
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content, body)
 
-        if method == "GET":
-            res_status = 200
-            res_content = {
-                "status": "success",
-                "data": {"id": u_obj.id, "name": u_obj.name, "email": u_obj.email, "role": u_obj.role, "created_at": u_obj.created_at.isoformat()}
-            }
 
-        elif method == "PUT":
-            name = body_data.get("name")
-            email = body_data.get("email")
-            if not name or not email:
-                latency = (time.time() - start_time) * 1000
-                _create_log(db, request_id, project.id, api_key.id, method, endpoint, 400, latency)
-                return JSONResponse(
-                    status_code=400,
-                    content={"detail": "PUT requires complete replacement fields 'name' and 'email'"},
-                    headers=rl_headers
-                )
-            u_obj.name = name
-            u_obj.email = email
-            u_obj.role = body_data.get("role", "developer")
-            db.commit()
-            db.refresh(u_obj)
-            res_status = 200
-            res_content = {
-                "status": "success",
-                "message": "User updated (replaced) successfully",
-                "data": {"id": u_obj.id, "name": u_obj.name, "email": u_obj.email, "role": u_obj.role}
-            }
+@router.get("/test/users/{user_id}")
+async def get_user_route(
+    user_id: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
 
-        elif method == "PATCH":
-            if "name" in body_data:
-                u_obj.name = body_data["name"]
-            if "email" in body_data:
-                u_obj.email = body_data["email"]
-            if "role" in body_data:
-                u_obj.role = body_data["role"]
-            db.commit()
-            db.refresh(u_obj)
-            res_status = 200
-            res_content = {
-                "status": "success",
-                "message": "User partially updated successfully",
-                "data": {"id": u_obj.id, "name": u_obj.name, "email": u_obj.email, "role": u_obj.role}
-            }
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
 
-        elif method == "DELETE":
-            db.delete(u_obj)
-            db.commit()
-            res_status = 204
-            res_content = None
+    code, content = run_safely(db, get_user, db, project, user_id)
 
-    # --- Step 6: Log & Return Real HTTP Response ---
-    latency = (time.time() - start_time) * 1000
-    req_headers_json = _safe_json(_sanitize_headers(request))
-    req_body_json = _safe_json(body_data) if body_data else None
-    res_body_json = _safe_json(res_content)
-    _create_log(
-        db, request_id, project.id, api_key.id, method, endpoint, res_status, latency,
-        request_headers=req_headers_json,
-        request_body=req_body_json,
-        response_body=res_body_json,
-    )
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
 
-    if res_status == 204:
-        return Response(status_code=204, headers=rl_headers)
 
-    return JSONResponse(
-        status_code=res_status,
-        content=res_content,
-        headers=rl_headers
-    )
+@router.put("/test/users/{user_id}")
+async def replace_user_route(
+    user_id: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    body, body_is_valid = await read_json_body(request, "PUT")
+    if body_is_valid:
+        code, content = run_safely(db, replace_user, db, project, user_id, body)
+    else:
+        code, content = 400, {"detail": "Invalid JSON body format"}
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content, body)
+
+
+@router.patch("/test/users/{user_id}")
+async def update_user_route(
+    user_id: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    body, body_is_valid = await read_json_body(request, "PATCH")
+    if body_is_valid:
+        code, content = run_safely(db, update_user, db, project, user_id, body)
+    else:
+        code, content = 400, {"detail": "Invalid JSON body format"}
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content, body)
+
+
+@router.delete("/test/users/{user_id}")
+async def delete_user_route(
+    user_id: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code, content = run_safely(db, delete_user, db, project, user_id)
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
+
+
+@router.api_route("/test/users", methods=["PUT", "PATCH", "DELETE"])
+async def wrong_method_on_collection_route(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """PUT / PATCH / DELETE are not allowed on /test/users (no id). Returns a logged 405."""
+    start_time = time.time()
+    request_id = make_request_id()
+    method = request.method.upper()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code = 405
+    content = {
+        "detail": f"Method {method} not allowed on collection endpoint '/test/users'. "
+                  f"Use '/test/users/{{id}}'."
+    }
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
+
+
+@router.api_route("/test/users/{user_id}", methods=["POST"])
+async def wrong_method_on_item_route(
+    user_id: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """POST is not allowed on /test/users/{id}. Returns a logged 405."""
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code = 405
+    content = {
+        "detail": "Method POST not allowed on item endpoint '/test/users/{id}'. "
+                  "Use '/test/users'."
+    }
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
+
+
+@router.get("/test/status/{status_code}")
+async def status_test_route(
+    status_code: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code, content = handle_status_test(status_code)
+    if code != 400:
+        headers["X-Gateway-Status-Test"] = str(code)
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)

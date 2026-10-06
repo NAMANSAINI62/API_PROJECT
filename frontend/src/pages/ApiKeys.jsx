@@ -48,9 +48,8 @@ export const ApiKeys = () => {
     }
     setError(null);
     try {
-      const filters = {
-        project_id: selectedProjectId,
-      };
+      const filters = {};
+      if (selectedProjectId) filters.project_id = selectedProjectId;
       if (debouncedSearch.trim()) filters.search = debouncedSearch.trim();
       if (statusFilter) filters.status = statusFilter;
       if (envFilter) filters.environment = envFilter;
@@ -61,8 +60,11 @@ export const ApiKeys = () => {
       ]);
       setKeys(keysData);
       setProjects(projectsData);
-      if (projectsData.length > 0 && !newKey.project_id) {
-        setNewKey((prev) => ({ ...prev, project_id: projectsData[0].id }));
+      if (projectsData.length > 0) {
+        const defaultProjId = selectedProjectId && projectsData.some((p) => String(p.id) === String(selectedProjectId))
+          ? selectedProjectId
+          : projectsData[0].id;
+        setNewKey((prev) => ({ ...prev, project_id: prev.project_id || defaultProjId }));
       }
     } catch {
       setError('Failed to load API keys.');
@@ -107,7 +109,11 @@ export const ApiKeys = () => {
       const rawKey = res?.raw_key ?? res?.data?.raw_key;
       if (!rawKey) throw new Error('No raw_key in response');
       setCreatedRawKey(rawKey);
-      fetchData();
+      
+      if (selectedProjectId !== validProject.id) {
+        setSelectedProjectId(validProject.id);
+      }
+      await fetchData();
       showToast('API Key generated');
     } catch (err) {
       console.error('Create key failed:', err.response?.status, err.response?.data, err);

@@ -20,8 +20,8 @@ def get_api_keys(
     db: Session = Depends(get_db)
 ):
     query = db.query(APIKey).join(Project).filter(Project.user_id == current_user.id)
-    if project_id:
-        query = query.filter(APIKey.project_id == project_id)
+    if project_id and project_id.strip():
+        query = query.filter(APIKey.project_id == project_id.strip())
     if status:
         query = query.filter(APIKey.status == status)
     if environment:
