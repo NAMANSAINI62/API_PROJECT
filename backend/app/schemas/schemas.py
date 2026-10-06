@@ -32,13 +32,11 @@ class ProjectCreate(BaseModel):
     name: str
     description: Optional[str] = None
     environment: Optional[str] = "production"
-    rate_limit_per_minute: Optional[int] = Field(default=5, ge=1, le=1000)
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     environment: Optional[str] = None
-    rate_limit_per_minute: Optional[int] = Field(default=None, ge=1, le=1000)
 
 class ProjectResponse(BaseModel):
     id: str
@@ -58,7 +56,6 @@ class APIKeyCreate(BaseModel):
     name: str
     project_id: Optional[str] = None
     environment: Optional[str] = "production"
-    rate_limit_per_minute: Optional[int] = Field(default=5, ge=1, le=1000)
     expires_in_days: Optional[int] = None
     expiration_days: Optional[int] = None
 

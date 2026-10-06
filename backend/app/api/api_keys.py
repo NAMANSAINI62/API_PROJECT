@@ -71,7 +71,6 @@ def create_api_key(
         key_prefix=key_prefix,
         key_hash=key_hash,
         environment=key_in.environment,
-        rate_limit_per_minute=key_in.rate_limit_per_minute,
         expires_at=expires_at,
         status="active"
     )

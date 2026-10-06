@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Card, Badge, LoadingState, ErrorState, Toast } from '../components/UIComponents';
-import { authService } from '../services/api';
+import { authService, formatDateTimeIST } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { User, Mail, Shield, Key, Calendar, CheckCircle2, Lock } from 'lucide-react';
 
@@ -107,10 +107,9 @@ export const Settings = () => {
               <span>Registration Date</span>
             </label>
             <div className="bg-[#F9FAFB] border border-[#E4E9EE] rounded-lg px-3.5 py-2.5 text-sm text-[#17212B]">
-              {displayUser?.created_at ? new Date(displayUser.created_at).toLocaleString() : 'N/A'}
+              {displayUser?.created_at ? formatDateTimeIST(displayUser.created_at) : 'N/A'}
             </div>
           </div>
-        </div>
       </Card>
 
       {/* Security & Authentication */}

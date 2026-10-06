@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, Trash2, Edit3, RefreshCw } from 'lucide-react';
-import { projectService } from '../services/api';
+import { projectService, formatDateIST } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { Card, Button, Badge, Modal, Input, EmptyState, LoadingState, ErrorState, ConfirmModal, Toast } from '../components/UIComponents';
 
@@ -146,7 +146,7 @@ export const Projects = () => {
                     </Badge>
                   </td>
                   <td className="py-3.5 px-4 text-[#687680]">
-                    {new Date(p.created_at).toLocaleDateString()}
+                    {formatDateIST(p.created_at)}
                   </td>
                   <td className="py-3.5 px-4 text-right space-x-2">
                     <Button

@@ -37,13 +37,21 @@ api.interceptors.response.use(
 
 export const formatDateIST = (dateStr) => {
   if (!dateStr) return '—';
-  const d = new Date(dateStr);
+  let safeDateStr = dateStr;
+  if (!safeDateStr.endsWith('Z') && !safeDateStr.includes('+') && safeDateStr.includes('T')) {
+    safeDateStr += 'Z'; // Force UTC parsing
+  }
+  const d = new Date(safeDateStr);
   return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
 };
 
 export const formatDateTimeIST = (dateStr) => {
   if (!dateStr) return '—';
-  const d = new Date(dateStr);
+  let safeDateStr = dateStr;
+  if (!safeDateStr.endsWith('Z') && !safeDateStr.includes('+') && safeDateStr.includes('T')) {
+    safeDateStr += 'Z'; // Force UTC parsing
+  }
+  const d = new Date(safeDateStr);
   return d.toLocaleString('en-IN', {
     timeZone: 'Asia/Kolkata',
     day: '2-digit', month: 'short', year: 'numeric',
@@ -54,7 +62,11 @@ export const formatDateTimeIST = (dateStr) => {
 
 export const formatTimeIST = (dateStr) => {
   if (!dateStr) return '—';
-  const d = new Date(dateStr);
+  let safeDateStr = dateStr;
+  if (!safeDateStr.endsWith('Z') && !safeDateStr.includes('+') && safeDateStr.includes('T')) {
+    safeDateStr += 'Z'; // Force UTC parsing
+  }
+  const d = new Date(safeDateStr);
   return d.toLocaleTimeString('en-IN', {
     timeZone: 'Asia/Kolkata',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
