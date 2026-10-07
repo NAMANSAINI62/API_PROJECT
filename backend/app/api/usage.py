@@ -1,5 +1,5 @@
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import Counter
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -18,7 +18,7 @@ def get_usage(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     params = {
         "user_id": current_user.id,
@@ -27,13 +27,13 @@ def get_usage(
 
     if project_id:
         where_clauses = [
-            "(l.project_id = :project_id OR l.project_id IS NULL)",
+            "l.project_id = :project_id",
             "l.created_at >= :start_date"
         ]
         params["project_id"] = project_id
     else:
         where_clauses = [
-            "(l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id) OR l.project_id IS NULL)",
+            "l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id)",
             "l.created_at >= :start_date"
         ]
 
@@ -49,7 +49,14 @@ def get_usage(
         WHERE {where_sql}
     """
 
-    results = db.execute(text(raw_sql), params).mappings().all()
+    from sqlalchemy.exc import OperationalError
+    from fastapi import HTTPException
+
+    try:
+        results = db.execute(text(raw_sql), params).mappings().all()
+    except OperationalError:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Database is temporarily unavailable. Please try again shortly.")
     logs = [dict(row) for row in results]
     status_counts = Counter(log["status_code"] for log in logs)
 
@@ -89,7 +96,7 @@ def get_usage(
     # Build daily time series bucket
     daily_buckets = {}
     for i in range(days):
-        day_str = (datetime.utcnow() - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d")
+        day_str = (datetime.now(timezone.utc) - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d")
         daily_buckets[day_str] = 0
 
     for log in logs:

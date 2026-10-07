@@ -13,17 +13,27 @@ from starlette.middleware.base import BaseHTTPMiddleware
 # Create tables automatically on startup
 Base.metadata.create_all(bind=engine)
 
+from sqlalchemy.orm import Session
+from app.api.gateway import replay_fallback_logs
+
+try:
+    with Session(engine) as db:
+        replay_fallback_logs(db)
+except Exception:
+    pass
+
+# I use these 3 argument to give the name, location and version for API in docs.
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
 )
 
-
+# Custom middleware helps to wraps every request and pass it on the actual route and uu get the response. back from that request.
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response = await call_next(request) # This sends the request to your route and waits for the response without this line routes will not run
+        response.headers.setdefault("X-Content-Type-Options", "nosniff") # It tells the browser: "Trust the file type which i declared.
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault(
@@ -37,9 +47,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             )
         return response
 
-
+##  the first line activates the security headers 
 app.add_middleware(SecurityHeadersMiddleware)
 
+# It tells the browser which frontends are allowed to talk to your backend.
 cors_origins = [origin.strip() for origin in settings.FRONTEND_URL.split(",") if origin.strip()]
 if settings.ENVIRONMENT.lower() != "production":
     cors_origins.extend([
@@ -65,11 +76,9 @@ app.include_router(usage.router, prefix=f"{settings.API_V1_STR}/usage", tags=["u
 app.include_router(gateway.router, prefix="", tags=["gateway"])
 app.include_router(gateway.router, prefix=settings.API_V1_STR, tags=["gateway"])
 
-
 @app.get("/")
 def root():
     return {"message": "PulseGate API Gateway active", "version": settings.VERSION}
-
 
 @app.get("/health")
 def health_check():

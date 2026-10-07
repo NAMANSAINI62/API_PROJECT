@@ -1,7 +1,7 @@
 import time
 import uuid
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -14,15 +14,11 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.api.deps import validate_gateway_api_key
 from app.services.rate_limiter import RateLimitService
+from app.core.redis_client import get_redis
 from app.models.all_models import APIRequestLog, APIKey, TestUser, Project
 from app.core.security import hash_api_key
 
 router = APIRouter()
-
-
-# ---------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------
 
 # Values of these keys are never saved in logs
 SECRET_WORDS = [
@@ -36,15 +32,95 @@ SAFE_HEADERS = [
     "x-forwarded-for", "x-forwarded-proto",
 ]
 
-
-# ---------------------------------------------------------------
-# 1. Small helper functions
-# ---------------------------------------------------------------
+REDIS_QUEUE_KEY = "failed_api_logs_queue"
+_last_replay_time = 0
 
 def make_request_id():
     """Create a unique id like 'req_a1b2c3d4e5f6'."""
     return "req_" + uuid.uuid4().hex[:12]
 
+def check_access(request, db, x_api_key, authorization, request_id, start_time):
+    """
+    Returns 4 things: (error_response, api_key, project, headers)
+    - If something is wrong, error_response has the response to send back.
+    - If all is fine, error_response is None.
+    """
+    method = request.method.upper()
+    endpoint = request.url.path.replace("/api/v1", "")
+    request_headers = get_safe_headers(request)
+    raw_key = get_api_key_from_headers(x_api_key, authorization)
+
+    # Step 1: check the API key
+    try:
+        api_key, project = validate_gateway_api_key(raw_key, db)
+    except OperationalError:
+        db.rollback()
+        content = {"detail": "Database is temporarily unavailable. Please try again in a few moments."}
+        save_log(db, request_id, None, None, method, endpoint, 503, start_time,
+                 request_headers=request_headers, response_body=content,
+                 key_hash=hash_api_key(raw_key) if raw_key else None)
+        return JSONResponse(status_code=503, content=content,
+                            headers={"X-Request-ID": request_id, "Retry-After": "30"}), None, None, None
+    except HTTPException as e:
+        try:
+            key_id, project_id = find_ids_for_failed_auth(request, db, raw_key, authorization)
+        except OperationalError:
+            db.rollback()
+            key_id, project_id = None, None
+
+        save_log(db, request_id, project_id, key_id, method, endpoint,
+                 e.status_code, start_time,
+                 request_headers=request_headers,
+                 response_body={"detail": e.detail})
+
+        error = JSONResponse(status_code=e.status_code,
+                             content={"detail": e.detail},
+                             headers={"X-Request-ID": request_id})
+        return error, None, None, None
+
+    request.state.project_id = project.id
+    request.state.api_key_id = api_key.id
+
+    global _last_replay_time
+    now_ts = time.time()
+    if now_ts - _last_replay_time > 60:
+        _last_replay_time = now_ts
+        try:
+            replay_fallback_logs(db)
+        except Exception:
+            pass
+
+    # Step 2: remember when the key was last used
+    api_key.last_used_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # Step 3: rate limit
+    rl = RateLimitService.check(
+        api_key_id=api_key.id,
+        limit_per_minute=api_key.rate_limit_per_minute,
+    )
+    headers = make_headers(request_id, rl)
+
+    if rl.is_limited:
+        headers["Retry-After"] = str(rl.ttl_remaining)
+        content = {
+            "detail": f"Rate limit exceeded. Limit: {rl.limit} req/min. "
+                      f"Current window usage: {rl.current_count}/{rl.limit}."
+        }
+        save_log(db, request_id, project.id, api_key.id, method, endpoint,
+                 429, start_time, request_headers=request_headers, response_body=content)
+        error = JSONResponse(status_code=429, content=content, headers=headers)
+        return error, None, None, None
+
+    return None, api_key, project, headers
+
+def get_safe_headers(request: Request):
+    """Return only the harmless headers from the request."""
+    result = {}
+    for key, value in request.headers.items():
+        if key.lower() in SAFE_HEADERS:
+            result[key] = value
+    return result
 
 def get_api_key_from_headers(x_api_key, authorization):
     """Read the key from X-API-Key or from 'Authorization: Bearer <key>'."""
@@ -58,87 +134,6 @@ def get_api_key_from_headers(x_api_key, authorization):
         return text
 
     return ""
-
-
-def hide_secrets(data):
-    """Replace secret values with [REDACTED] (also inside nested data)."""
-    if isinstance(data, dict):
-        result = {}
-        for key, value in data.items():
-            if str(key).lower() in SECRET_WORDS:
-                result[key] = "[REDACTED]"
-            else:
-                result[key] = hide_secrets(value)
-        return result
-
-    if isinstance(data, list):
-        return [hide_secrets(item) for item in data]
-
-    return data
-
-
-def to_json(data):
-    """Convert data to a JSON string for the log (secrets hidden, max 10KB)."""
-    if data is None:
-        return None
-
-    try:
-        text = json.dumps(hide_secrets(data), default=str)
-    except Exception:
-        return None
-
-    return text[:10240]
-
-
-def get_safe_headers(request: Request):
-    """Return only the harmless headers from the request."""
-    result = {}
-    for key, value in request.headers.items():
-        if key.lower() in SAFE_HEADERS:
-            result[key] = value
-    return result
-
-
-def user_to_dict(user):
-    """Turn a TestUser database object into a normal dictionary."""
-    return {
-        "id": user.id,
-        "name": user.name,
-        "email": user.email,
-        "role": user.role,
-        "created_at": user.created_at.isoformat(),
-    }
-
-
-# ---------------------------------------------------------------
-# 2. Logging
-# ---------------------------------------------------------------
-
-def save_log(db, request_id, project_id, api_key_id, method, endpoint,
-             status_code, start_time,
-             request_headers=None, request_body=None, response_body=None):
-    """Save one row in the api request log table."""
-    latency_ms = (time.time() - start_time) * 1000
-
-    log = APIRequestLog(
-        request_id=request_id,
-        project_id=project_id,
-        api_key_id=api_key_id,
-        method=method.upper(),
-        endpoint=endpoint,
-        status_code=status_code,
-        latency_ms=round(latency_ms, 2),
-        request_headers=to_json(request_headers),
-        request_body=to_json(request_body),
-        response_body=to_json(response_body),
-    )
-    db.add(log)
-    db.commit()
-
-
-# ---------------------------------------------------------------
-# 3. Failed authentication: find key id and project id for the log
-# ---------------------------------------------------------------
 
 def find_ids_for_failed_auth(request, db, raw_key, authorization):
     """
@@ -180,10 +175,111 @@ def find_ids_for_failed_auth(request, db, raw_key, authorization):
 
     return key_id, project_id
 
+def save_log_fallback(entry):
+    """DB is down: keep the log in a Redis list instead."""
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.lpush(REDIS_QUEUE_KEY, json.dumps(entry, default=str))
+    except Exception as e:
+        print(f"Redis is also down! Log lost: {e}")
 
-# ---------------------------------------------------------------
-# 4. Rate limit headers
-# ---------------------------------------------------------------
+def replay_fallback_logs(db):
+    """DB is back: move saved logs from Redis into the PostgreSQL database."""
+    r = get_redis()
+    if not r:
+        return
+        
+    while True:
+        try:
+            log_json = r.rpop(REDIS_QUEUE_KEY)
+        except Exception:
+            break
+            
+        if not log_json:
+            break
+
+        try:
+            e = json.loads(log_json)
+            
+            # If the DB was down during key check, find the project now
+            if not e.get("project_id") and e.get("key_hash"):
+                k = db.query(APIKey).filter(APIKey.key_hash == e["key_hash"]).first()
+                if k:
+                    e["api_key_id"], e["project_id"] = k.id, k.project_id
+            
+            kwargs = {k: v for k, v in e.items() if k not in ["key_hash", "created_at"]}
+            if "created_at" in e:
+                kwargs["created_at"] = datetime.fromisoformat(e["created_at"])
+            
+            db.add(APIRequestLog(**kwargs))
+            db.commit()
+        except OperationalError:
+            db.rollback()
+            # DB down again, push back to queue
+            try:
+                r.rpush(REDIS_QUEUE_KEY, log_json)
+            except Exception:
+                pass
+            break
+        except Exception:
+            db.rollback()              # bad line, skip it
+
+def save_log(db, request_id, project_id, api_key_id, method, endpoint,
+             status_code, start_time,
+             request_headers=None, request_body=None, response_body=None,
+             key_hash=None):
+    """Save one row in the api request log table or fallback file."""
+    latency_ms = round((time.time() - start_time) * 1000, 2)
+    entry = {
+        "request_id": request_id, "project_id": project_id,
+        "api_key_id": api_key_id, "key_hash": key_hash,
+        "method": method.upper(), "endpoint": endpoint,
+        "status_code": status_code, "latency_ms": latency_ms,
+        "request_headers": to_json(request_headers),
+        "request_body": to_json(request_body),
+        "response_body": to_json(response_body),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        kwargs = {k: v for k, v in entry.items() if k not in ["key_hash", "created_at"]}
+        kwargs["created_at"] = datetime.fromisoformat(entry["created_at"])
+        db.add(APIRequestLog(**kwargs))
+        db.commit()
+    except OperationalError:
+        db.rollback()
+        save_log_fallback(entry)
+    except Exception:
+        db.rollback()
+
+def to_json(data):
+    """Convert data to a JSON string for the log (secrets hidden, max 10KB)."""
+    if data is None:
+        return None
+
+    try:
+        text = json.dumps(hide_secrets(data), default=str)
+    except Exception:
+        return None
+
+    return text[:10240]
+
+def hide_secrets(data):
+    """Replace secret values with [REDACTED] (also inside nested data)."""
+    if isinstance(data, dict):
+        result = {}
+        for key, value in data.items():
+            if str(key).lower() in SECRET_WORDS:
+                result[key] = "[REDACTED]"
+            else:
+                result[key] = hide_secrets(value)
+        return result
+
+    if isinstance(data, list):
+        return [hide_secrets(item) for item in data]
+
+    return data
 
 def make_headers(request_id, rl):
     """Headers that go in every response."""
@@ -197,35 +293,6 @@ def make_headers(request_id, rl):
         "X-RateLimit-Remaining": str(remaining),
         "X-RateLimit-Reset": str(rl.ttl_remaining),
     }
-
-
-# ---------------------------------------------------------------
-# 5. Status test (fake 3xx / 5xx responses)  -- SAME AS BEFORE
-# ---------------------------------------------------------------
-
-def handle_status_test(status_code):
-    """Return a fake redirect or server-error response."""
-    is_redirect = 300 <= status_code < 400
-    is_server_error = 500 <= status_code < 600
-
-    if not is_redirect and not is_server_error:
-        return 400, {"detail": "Status test only supports 3xx and 5xx codes"}
-
-    if is_redirect:
-        message = "Gateway redirect response"
-    else:
-        message = "Gateway upstream server error response"
-
-    return status_code, {
-        "status": "simulated",
-        "status_code": status_code,
-        "message": message,
-    }
-
-
-# ---------------------------------------------------------------
-# 6. Reading the request body
-# ---------------------------------------------------------------
 
 async def read_json_body(request: Request, method: str):
     """
@@ -243,20 +310,56 @@ async def read_json_body(request: Request, method: str):
     except Exception:
         return {}, False
 
+def run_safely(db, function, *args):
+    try:
+        return function(*args)
+    except OperationalError:
+        # database is down or unreachable
+        db.rollback()
+        return 503, {"detail": "Database unavailable"}
+    except Exception as error:
+        # any unexpected bug in our code
+        db.rollback()
+        print("Unexpected error:", error)
+        return 500, {"detail": "Internal server error"}
 
-# ---------------------------------------------------------------
-# 7. User functions (each returns: status_code, content)
-# ---------------------------------------------------------------
+def finish_request(request, db, request_id, start_time, api_key, project,
+                   headers, code, content, body=None):
+    method = request.method.upper()
+    endpoint = request.url.path.replace("/api/v1", "")
+    
+    # Use request.state since project and api_key objects might be detached
+    p_id = getattr(request.state, "project_id", project.id if project else None)
+    a_id = getattr(request.state, "api_key_id", api_key.id if api_key else None)
 
-def list_users(db, project):
-    users = db.query(TestUser).filter(TestUser.project_id == project.id).all()
+    save_log(db, request_id, p_id, a_id, method, endpoint, code, start_time,
+             request_headers=get_safe_headers(request),
+             request_body=body if body else None,
+             response_body=content)
 
-    user_list = []
-    for u in users:
-        user_list.append(user_to_dict(u))
+    if code == 204:
+        return Response(status_code=204, headers=headers)
 
-    return 200, {"status": "success", "total": len(user_list), "data": user_list}
+    return JSONResponse(status_code=code, content=content, headers=headers)
 
+def user_to_dict(user):
+    """Turn a TestUser database object into a normal dictionary."""
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+        "created_at": user.created_at.isoformat(),
+    }
+
+def find_user(db, project, user_id):
+    """Find one user of this project. Returns None if not found."""
+    return db.query(TestUser).filter(
+        TestUser.id == user_id,
+        TestUser.project_id == project.id,
+    ).first()
+
+# -- Create User --
 
 def create_user(db, project, body):
     name = str(body.get("name") or body.get("product") or body.get("title") or f"Resource_{uuid.uuid4().hex[:6]}")
@@ -283,14 +386,62 @@ def create_user(db, project, body):
         "data": response_data,
     }
 
+@router.post("/test/users")
+async def create_user_route(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
 
-def find_user(db, project, user_id):
-    """Find one user of this project. Returns None if not found."""
-    return db.query(TestUser).filter(
-        TestUser.id == user_id,
-        TestUser.project_id == project.id,
-    ).first()
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
 
+    body, body_is_valid = await read_json_body(request, "POST")
+    if body_is_valid:
+        code, content = run_safely(db, create_user, db, project, body)
+    else:
+        code, content = 400, {"detail": "Invalid JSON body format"}
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content, body)
+
+# -- List Users --
+
+def list_users(db, project):
+    users = db.query(TestUser).filter(TestUser.project_id == project.id).all()
+
+    user_list = []
+    for u in users:
+        user_list.append(user_to_dict(u))
+
+    return 200, {"status": "success", "total": len(user_list), "data": user_list}
+
+@router.get("/test/users")
+async def list_users_route(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code, content = run_safely(db, list_users, db, project)
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
+
+# -- Get User --
 
 def get_user(db, project, user_id):
     user = find_user(db, project, user_id)
@@ -299,6 +450,28 @@ def get_user(db, project, user_id):
 
     return 200, {"status": "success", "data": user_to_dict(user)}
 
+@router.get("/test/users/{user_id}")
+async def get_user_route(
+    user_id: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code, content = run_safely(db, get_user, db, project, user_id)
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
+
+# -- Replace User --
 
 def replace_user(db, project, user_id, body):
     """PUT: replaces or updates resource fields."""
@@ -328,6 +501,32 @@ def replace_user(db, project, user_id, body):
         "data": response_data,
     }
 
+@router.put("/test/users/{user_id}")
+async def replace_user_route(
+    user_id: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    body, body_is_valid = await read_json_body(request, "PUT")
+    if body_is_valid:
+        code, content = run_safely(db, replace_user, db, project, user_id, body)
+    else:
+        code, content = 400, {"detail": "Invalid JSON body format"}
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content, body)
+
+# -- Update User --
 
 def update_user(db, project, user_id, body):
     """PATCH: only the sent fields are changed."""
@@ -357,209 +556,6 @@ def update_user(db, project, user_id, body):
         "data": response_data,
     }
 
-
-def delete_user(db, project, user_id):
-    user = find_user(db, project, user_id)
-    if user is None:
-        return 404, {"detail": f"User with ID {user_id} not found in project"}
-
-    db.delete(user)
-    db.commit()
-    return 204, None
-
-
-# ---------------------------------------------------------------
-# 8. Shared helper 1: runs BEFORE every route (key check + rate limit)
-# ---------------------------------------------------------------
-
-def check_access(request, db, x_api_key, authorization, request_id, start_time):
-    """
-    Returns 4 things: (error_response, api_key, project, headers)
-    - If something is wrong, error_response has the response to send back.
-    - If all is fine, error_response is None.
-    """
-    method = request.method.upper()
-    endpoint = request.url.path.replace("/api/v1", "")
-    request_headers = get_safe_headers(request)
-    raw_key = get_api_key_from_headers(x_api_key, authorization)
-
-    # Step 1: check the API key
-    try:
-        api_key, project = validate_gateway_api_key(raw_key, db)
-    except HTTPException as e:
-        key_id, project_id = find_ids_for_failed_auth(request, db, raw_key, authorization)
-
-        save_log(db, request_id, project_id, key_id, method, endpoint,
-                 e.status_code, start_time,
-                 request_headers=request_headers,
-                 response_body={"detail": e.detail})
-
-        error = JSONResponse(status_code=e.status_code,
-                             content={"detail": e.detail},
-                             headers={"X-Request-ID": request_id})
-        return error, None, None, None
-
-    # Step 2: remember when the key was last used
-    api_key.last_used_at = datetime.utcnow()
-    db.commit()
-
-    # Step 3: rate limit
-    rl = RateLimitService.check(
-        api_key_id=api_key.id,
-        limit_per_minute=api_key.rate_limit_per_minute,
-    )
-    headers = make_headers(request_id, rl)
-
-    if rl.is_limited:
-        headers["Retry-After"] = str(rl.ttl_remaining)
-        content = {
-            "detail": f"Rate limit exceeded. Limit: {rl.limit} req/min. "
-                      f"Current window usage: {rl.current_count}/{rl.limit}."
-        }
-        save_log(db, request_id, project.id, api_key.id, method, endpoint,
-                 429, start_time, request_headers=request_headers, response_body=content)
-        error = JSONResponse(status_code=429, content=content, headers=headers)
-        return error, None, None, None
-
-    return None, api_key, project, headers
-
-
-# ---------------------------------------------------------------
-# 9. Shared helper 2: runs AFTER every route (log + send response)
-# ---------------------------------------------------------------
-
-def finish_request(request, db, request_id, start_time, api_key, project,
-                   headers, code, content, body=None):
-    method = request.method.upper()
-    endpoint = request.url.path.replace("/api/v1", "")
-
-    save_log(db, request_id, project.id, api_key.id, method, endpoint, code, start_time,
-             request_headers=get_safe_headers(request),
-             request_body=body if body else None,
-             response_body=content)
-
-    if code == 204:
-        return Response(status_code=204, headers=headers)
-
-    return JSONResponse(status_code=code, content=content, headers=headers)
-
-
-# ---------------------------------------------------------------
-# 10. Shared helper 3: catches REAL errors and turns them into 500 / 503
-# ---------------------------------------------------------------
-
-def run_safely(db, function, *args):
-    try:
-        return function(*args)
-    except OperationalError:
-        # database is down or unreachable
-        db.rollback()
-        return 503, {"detail": "Database unavailable"}
-    except Exception as error:
-        # any unexpected bug in our code
-        db.rollback()
-        print("Unexpected error:", error)
-        return 500, {"detail": "Internal server error"}
-
-
-# ---------------------------------------------------------------
-# 11. Routes: one function per job
-# ---------------------------------------------------------------
-
-@router.get("/test/users")
-async def list_users_route(
-    request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db),
-):
-    start_time = time.time()
-    request_id = make_request_id()
-
-    error, api_key, project, headers = check_access(
-        request, db, x_api_key, authorization, request_id, start_time)
-    if error:
-        return error
-
-    code, content = run_safely(db, list_users, db, project)
-
-    return finish_request(request, db, request_id, start_time,
-                          api_key, project, headers, code, content)
-
-
-@router.post("/test/users")
-async def create_user_route(
-    request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db),
-):
-    start_time = time.time()
-    request_id = make_request_id()
-
-    error, api_key, project, headers = check_access(
-        request, db, x_api_key, authorization, request_id, start_time)
-    if error:
-        return error
-
-    body, body_is_valid = await read_json_body(request, "POST")
-    if body_is_valid:
-        code, content = run_safely(db, create_user, db, project, body)
-    else:
-        code, content = 400, {"detail": "Invalid JSON body format"}
-
-    return finish_request(request, db, request_id, start_time,
-                          api_key, project, headers, code, content, body)
-
-
-@router.get("/test/users/{user_id}")
-async def get_user_route(
-    user_id: int,
-    request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db),
-):
-    start_time = time.time()
-    request_id = make_request_id()
-
-    error, api_key, project, headers = check_access(
-        request, db, x_api_key, authorization, request_id, start_time)
-    if error:
-        return error
-
-    code, content = run_safely(db, get_user, db, project, user_id)
-
-    return finish_request(request, db, request_id, start_time,
-                          api_key, project, headers, code, content)
-
-
-@router.put("/test/users/{user_id}")
-async def replace_user_route(
-    user_id: int,
-    request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db),
-):
-    start_time = time.time()
-    request_id = make_request_id()
-
-    error, api_key, project, headers = check_access(
-        request, db, x_api_key, authorization, request_id, start_time)
-    if error:
-        return error
-
-    body, body_is_valid = await read_json_body(request, "PUT")
-    if body_is_valid:
-        code, content = run_safely(db, replace_user, db, project, user_id, body)
-    else:
-        code, content = 400, {"detail": "Invalid JSON body format"}
-
-    return finish_request(request, db, request_id, start_time,
-                          api_key, project, headers, code, content, body)
-
-
 @router.patch("/test/users/{user_id}")
 async def update_user_route(
     user_id: int,
@@ -585,6 +581,16 @@ async def update_user_route(
     return finish_request(request, db, request_id, start_time,
                           api_key, project, headers, code, content, body)
 
+# -- Delete User --
+
+def delete_user(db, project, user_id):
+    user = find_user(db, project, user_id)
+    if user is None:
+        return 404, {"detail": f"User with ID {user_id} not found in project"}
+
+    db.delete(user)
+    db.commit()
+    return 204, None
 
 @router.delete("/test/users/{user_id}")
 async def delete_user_route(
@@ -607,6 +613,51 @@ async def delete_user_route(
     return finish_request(request, db, request_id, start_time,
                           api_key, project, headers, code, content)
 
+# -- Status Test --
+
+def handle_status_test(status_code):
+    """Return a fake redirect or server-error response."""
+    is_redirect = 300 <= status_code < 400
+    is_server_error = 500 <= status_code < 600
+
+    if not is_redirect and not is_server_error:
+        return 400, {"detail": "Status test only supports 3xx and 5xx codes"}
+
+    if is_redirect:
+        message = "Gateway redirect response"
+    else:
+        message = "Gateway upstream server error response"
+
+    return status_code, {
+        "status": "simulated",
+        "status_code": status_code,
+        "message": message,
+    }
+
+@router.get("/test/status/{status_code}")
+async def status_test_route(
+    status_code: int,
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    start_time = time.time()
+    request_id = make_request_id()
+
+    error, api_key, project, headers = check_access(
+        request, db, x_api_key, authorization, request_id, start_time)
+    if error:
+        return error
+
+    code, content = handle_status_test(status_code)
+    if code != 400:
+        headers["X-Gateway-Status-Test"] = str(code)
+
+    return finish_request(request, db, request_id, start_time,
+                          api_key, project, headers, code, content)
+
+# -- Other Routes --
 
 @router.api_route("/test/users", methods=["PUT", "PATCH", "DELETE"])
 async def wrong_method_on_collection_route(
@@ -634,7 +685,6 @@ async def wrong_method_on_collection_route(
     return finish_request(request, db, request_id, start_time,
                           api_key, project, headers, code, content)
 
-
 @router.api_route("/test/users/{user_id}", methods=["POST"])
 async def wrong_method_on_item_route(
     user_id: int,
@@ -657,30 +707,6 @@ async def wrong_method_on_item_route(
         "detail": "Method POST not allowed on item endpoint '/test/users/{id}'. "
                   "Use '/test/users'."
     }
-
-    return finish_request(request, db, request_id, start_time,
-                          api_key, project, headers, code, content)
-
-
-@router.get("/test/status/{status_code}")
-async def status_test_route(
-    status_code: int,
-    request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-    db: Session = Depends(get_db),
-):
-    start_time = time.time()
-    request_id = make_request_id()
-
-    error, api_key, project, headers = check_access(
-        request, db, x_api_key, authorization, request_id, start_time)
-    if error:
-        return error
-
-    code, content = handle_status_test(status_code)
-    if code != 400:
-        headers["X-Gateway-Status-Test"] = str(code)
 
     return finish_request(request, db, request_id, start_time,
                           api_key, project, headers, code, content)

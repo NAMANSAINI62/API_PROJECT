@@ -110,6 +110,7 @@ export const Settings = () => {
               {displayUser?.created_at ? formatDateTimeIST(displayUser.created_at) : 'N/A'}
             </div>
           </div>
+        </div>
       </Card>
 
       {/* Security & Authentication */}

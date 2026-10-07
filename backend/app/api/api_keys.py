@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
@@ -32,7 +32,7 @@ def get_api_keys(
     keys = query.order_by(APIKey.created_at.desc()).all()
 
     # Check and mark expired keys dynamically
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     for key in keys:
         if key.expires_at and key.expires_at < now and key.status == "active":
             key.status = "expired"
@@ -63,7 +63,7 @@ def create_api_key(
     exp_days = key_in.expires_in_days or key_in.expiration_days
     expires_at = None
     if exp_days:
-        expires_at = datetime.utcnow() + timedelta(days=exp_days)
+        expires_at = datetime.now(timezone.utc) + timedelta(days=exp_days)
 
     api_key = APIKey(
         project_id=project.id,

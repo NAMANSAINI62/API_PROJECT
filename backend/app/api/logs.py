@@ -30,12 +30,12 @@ def get_logs(
 
     if project_id:
         where_clauses = [
-            "(l.project_id = :project_id OR l.project_id IS NULL)"
+            "l.project_id = :project_id"
         ]
         params["project_id"] = project_id
     else:
         where_clauses = [
-            "(l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id) OR l.project_id IS NULL)"
+            "l.project_id IN (SELECT id FROM projects WHERE user_id = :user_id)"
         ]
 
     if status_code:
@@ -83,7 +83,14 @@ def get_logs(
         LIMIT :limit OFFSET :offset
     """
 
-    results = db.execute(text(raw_sql), params).mappings().all()
+    from sqlalchemy.exc import OperationalError
+    from fastapi import HTTPException
+
+    try:
+        results = db.execute(text(raw_sql), params).mappings().all()
+    except OperationalError:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Database is temporarily unavailable. Please try again shortly.")
 
     logs = []
     for row in results:

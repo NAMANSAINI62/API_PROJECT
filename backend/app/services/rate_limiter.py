@@ -56,7 +56,6 @@ redis.call('EXPIRE', key, ttl)
 return {is_rate_limited, math.floor(available_tokens)}
 """
 
-
 @dataclass
 class RateLimitResult:
     """Result of a rate-limit check for a single API key request."""
@@ -64,7 +63,6 @@ class RateLimitResult:
     current_count: int
     limit: int
     ttl_remaining: int  # seconds until window resets
-
 
 # In-memory fallback for when Redis is unavailable
 _fallback_cache = {}
@@ -151,7 +149,6 @@ class RateLimitService:
         except Exception as e:
             logger.error(f"Redis rate limiting error: {e}")
             return RateLimitService._fallback_check(api_key_id, limit_per_minute)
-
 
 class CacheService:
     """

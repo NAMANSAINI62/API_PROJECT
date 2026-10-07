@@ -3,7 +3,6 @@ from urllib.parse import quote
 
 from pydantic_settings import BaseSettings
 
-
 class Settings(BaseSettings):
     PROJECT_NAME: str = "PulseGate"
     VERSION: str = "1.0.0"
@@ -35,14 +34,12 @@ class Settings(BaseSettings):
         env_file = ".env"
         extra = "ignore"
 
-
 settings = Settings()
 
 if settings.DATABASE_URL.startswith("postgres://"):
     settings.DATABASE_URL = settings.DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif settings.DATABASE_URL.startswith("postgresql://") and not settings.DATABASE_URL.startswith("postgresql+"):
     settings.DATABASE_URL = settings.DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
-
 
 # Build service URLs from separate credentials so passwords containing URL
 # characters such as "@", ":" or "/" remain valid connection credentials.

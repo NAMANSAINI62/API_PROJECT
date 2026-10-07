@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import hash_api_key
 from app.models.all_models import User, APIKey, Project
+from sqlalchemy.exc import OperationalError
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
 
@@ -23,19 +24,21 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     except JWTError:
         raise credentials_exception
 
-    user = db.query(User).filter(User.id == user_id).first()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+    except OperationalError:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Database is temporarily unavailable. Please try again shortly.")
     if user is None:
         raise credentials_exception
     if not user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
     return user
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 def validate_gateway_api_key(raw_api_key: str, db: Session) -> tuple[APIKey, Project]:
-    """
-    Validates customer API key for the Gateway.
-    """
+    "Validates customer API key for the Gateway."
     if not raw_api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key missing")
     
@@ -45,11 +48,15 @@ def validate_gateway_api_key(raw_api_key: str, db: Session) -> tuple[APIKey, Pro
 
     key_hash = hash_api_key(raw_api_key)
 
-    api_key = db.query(APIKey).filter(APIKey.key_hash == key_hash).first()
+    try:
+        api_key = db.query(APIKey).filter(APIKey.key_hash == key_hash).first()
+    except OperationalError:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Database is temporarily unavailable. Please try again shortly.")
     if not api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key (key not found)")
 
-    if api_key.expires_at and api_key.expires_at < datetime.utcnow():
+    if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
         if api_key.status == "active":
             api_key.status = "expired"
             db.commit()
