@@ -10,17 +10,8 @@ from app.models import all_models  # noqa
 from app.api import auth, projects, api_keys, logs, usage, gateway
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# Create tables automatically on startup
+# Create tables automatically on startup (including the new rate_limit_buckets table)
 Base.metadata.create_all(bind=engine)
-
-from sqlalchemy.orm import Session
-from app.api.gateway import replay_fallback_logs
-
-try:
-    with Session(engine) as db:
-        replay_fallback_logs(db)
-except Exception:
-    pass
 
 # I use these 3 argument to give the name, location and version for API in docs.
 app = FastAPI(
@@ -47,7 +38,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             )
         return response
 
-##  the first line activates the security headers 
+##  the first line activates the security headers
 app.add_middleware(SecurityHeadersMiddleware)
 
 # It tells the browser which frontends are allowed to talk to your backend.

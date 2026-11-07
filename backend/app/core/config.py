@@ -9,13 +9,11 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 
-    # Database and Redis
+    # Database
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
         "postgresql://postgres@postgres:5432/pulsegate",
     )
-
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
     # JWT authentication
     JWT_SECRET: str = os.getenv("JWT_SECRET", "")
@@ -53,14 +51,6 @@ if postgres_password and postgres_host:
         f"@{postgres_host}:5432/{postgres_database}"
     )
 
-redis_password = os.getenv("REDIS_PASSWORD")
-redis_host = os.getenv("REDIS_HOST")
-if redis_password and redis_host:
-    settings.REDIS_URL = (
-        f"redis://:{quote(redis_password, safe='')}@{redis_host}:6379/0"
-    )
-
 if settings.ENVIRONMENT.lower() == "production":
     if not settings.JWT_SECRET or len(settings.JWT_SECRET) < 32:
         raise RuntimeError("JWT_SECRET must be a strong, externally managed secret in production")
-

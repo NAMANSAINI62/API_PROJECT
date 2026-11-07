@@ -80,3 +80,12 @@ class TestUser(Base):
     email = Column(String, nullable=False)
     role = Column(String, default="user")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+# New table: replaces Redis Token Bucket rate limiter
+class RateLimitBucket(Base):
+    __tablename__ = "rate_limit_buckets"
+
+    # One row per API key — primary key IS the api_key_id
+    api_key_id = Column(String, ForeignKey("api_keys.id", ondelete="CASCADE"), primary_key=True)
+    tokens = Column(Float, nullable=False)           # Available tokens in the bucket
+    last_refilled_at = Column(DateTime, nullable=False)  # When the bucket was last refilled

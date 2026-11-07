@@ -5,7 +5,6 @@ from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.models.all_models import User, Project
 from app.schemas.schemas import ProjectCreate, ProjectUpdate, ProjectResponse
-from app.services.rate_limiter import CacheService
 
 router = APIRouter()
 
@@ -24,18 +23,12 @@ def create_project(
         user_id=current_user.id,
         name=project_in.name,
         description=project_in.description,
-        environment=project_in.environment
+        environment=project_in.environment,
+        rate_limit_per_minute=project_in.rate_limit_per_minute
     )
     db.add(project)
     db.commit()
     db.refresh(project)
-
-    # Set initial cache
-    CacheService.set_project_cache(project.id, {
-        "id": project.id,
-        "rate_limit_per_minute": project.rate_limit_per_minute,
-        "environment": project.environment
-    })
 
     return project
 
@@ -53,7 +46,7 @@ def get_project(
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
-@router.patch("/{project_id}", response_model=ProjectResponse)
+@router.put("/{project_id}", response_model=ProjectResponse)
 def update_project(
     project_id: str,
     project_in: ProjectUpdate,
@@ -74,12 +67,6 @@ def update_project(
     db.commit()
     db.refresh(project)
 
-    CacheService.set_project_cache(project.id, {
-        "id": project.id,
-        "rate_limit_per_minute": project.rate_limit_per_minute,
-        "environment": project.environment
-    })
-
     return project
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -97,5 +84,4 @@ def delete_project(
 
     db.delete(project)
     db.commit()
-    CacheService.delete_project_cache(project_id)
     return None

@@ -14,7 +14,6 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.api.deps import validate_gateway_api_key
 from app.services.rate_limiter import RateLimitService
-from app.core.redis_client import get_redis
 from app.models.all_models import APIRequestLog, APIKey, TestUser, Project
 from app.core.security import hash_api_key
 
@@ -31,9 +30,6 @@ SAFE_HEADERS = [
     "accept", "content-type", "user-agent", "x-request-id",
     "x-forwarded-for", "x-forwarded-proto",
 ]
-
-REDIS_QUEUE_KEY = "failed_api_logs_queue"
-_last_replay_time = 0
 
 def make_request_id():
     """Create a unique id like 'req_a1b2c3d4e5f6'."""
@@ -81,23 +77,15 @@ def check_access(request, db, x_api_key, authorization, request_id, start_time):
     request.state.project_id = project.id
     request.state.api_key_id = api_key.id
 
-    global _last_replay_time
-    now_ts = time.time()
-    if now_ts - _last_replay_time > 60:
-        _last_replay_time = now_ts
-        try:
-            replay_fallback_logs(db)
-        except Exception:
-            pass
-
     # Step 2: remember when the key was last used
     api_key.last_used_at = datetime.now(timezone.utc)
     db.commit()
 
-    # Step 3: rate limit
+    # Step 3: rate limit — now handled entirely by PostgreSQL
     rl = RateLimitService.check(
         api_key_id=api_key.id,
         limit_per_minute=api_key.rate_limit_per_minute,
+        db=db,
     )
     headers = make_headers(request_id, rl)
 
@@ -175,81 +163,30 @@ def find_ids_for_failed_auth(request, db, raw_key, authorization):
 
     return key_id, project_id
 
-def save_log_fallback(entry):
-    """DB is down: keep the log in a Redis list instead."""
-    r = get_redis()
-    if not r:
-        return
-    try:
-        r.lpush(REDIS_QUEUE_KEY, json.dumps(entry, default=str))
-    except Exception as e:
-        print(f"Redis is also down! Log lost: {e}")
-
-def replay_fallback_logs(db):
-    """DB is back: move saved logs from Redis into the PostgreSQL database."""
-    r = get_redis()
-    if not r:
-        return
-        
-    while True:
-        try:
-            log_json = r.rpop(REDIS_QUEUE_KEY)
-        except Exception:
-            break
-            
-        if not log_json:
-            break
-
-        try:
-            e = json.loads(log_json)
-            
-            # If the DB was down during key check, find the project now
-            if not e.get("project_id") and e.get("key_hash"):
-                k = db.query(APIKey).filter(APIKey.key_hash == e["key_hash"]).first()
-                if k:
-                    e["api_key_id"], e["project_id"] = k.id, k.project_id
-            
-            kwargs = {k: v for k, v in e.items() if k not in ["key_hash", "created_at"]}
-            if "created_at" in e:
-                kwargs["created_at"] = datetime.fromisoformat(e["created_at"])
-            
-            db.add(APIRequestLog(**kwargs))
-            db.commit()
-        except OperationalError:
-            db.rollback()
-            # DB down again, push back to queue
-            try:
-                r.rpush(REDIS_QUEUE_KEY, log_json)
-            except Exception:
-                pass
-            break
-        except Exception:
-            db.rollback()              # bad line, skip it
-
 def save_log(db, request_id, project_id, api_key_id, method, endpoint,
              status_code, start_time,
              request_headers=None, request_body=None, response_body=None,
              key_hash=None):
-    """Save one row in the api request log table or fallback file."""
+    """Save one row in the api request log table. Silently skips if DB is down."""
     latency_ms = round((time.time() - start_time) * 1000, 2)
-    entry = {
-        "request_id": request_id, "project_id": project_id,
-        "api_key_id": api_key_id, "key_hash": key_hash,
-        "method": method.upper(), "endpoint": endpoint,
-        "status_code": status_code, "latency_ms": latency_ms,
-        "request_headers": to_json(request_headers),
-        "request_body": to_json(request_body),
-        "response_body": to_json(response_body),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
     try:
-        kwargs = {k: v for k, v in entry.items() if k not in ["key_hash", "created_at"]}
-        kwargs["created_at"] = datetime.fromisoformat(entry["created_at"])
-        db.add(APIRequestLog(**kwargs))
+        log = APIRequestLog(
+            request_id=request_id,
+            project_id=project_id,
+            api_key_id=api_key_id,
+            method=method.upper(),
+            endpoint=endpoint,
+            status_code=status_code,
+            latency_ms=latency_ms,
+            request_headers=to_json(request_headers),
+            request_body=to_json(request_body),
+            response_body=to_json(response_body),
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(log)
         db.commit()
     except OperationalError:
         db.rollback()
-        save_log_fallback(entry)
     except Exception:
         db.rollback()
 
@@ -314,11 +251,9 @@ def run_safely(db, function, *args):
     try:
         return function(*args)
     except OperationalError:
-        # database is down or unreachable
         db.rollback()
         return 503, {"detail": "Database unavailable"}
     except Exception as error:
-        # any unexpected bug in our code
         db.rollback()
         print("Unexpected error:", error)
         return 500, {"detail": "Internal server error"}
@@ -327,7 +262,7 @@ def finish_request(request, db, request_id, start_time, api_key, project,
                    headers, code, content, body=None):
     method = request.method.upper()
     endpoint = request.url.path.replace("/api/v1", "")
-    
+
     # Use request.state since project and api_key objects might be detached
     p_id = getattr(request.state, "project_id", project.id if project else None)
     a_id = getattr(request.state, "api_key_id", api_key.id if api_key else None)

@@ -1,60 +1,14 @@
-import json
-import time
 import math
+import time
 import logging
 from dataclasses import dataclass
-from app.core.redis_client import get_redis
+from datetime import datetime, timezone
+
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 logger = logging.getLogger(__name__)
 
-RATE_LIMIT_LUA = """
-
-local key = KEYS[1]
-local max_tokens = tonumber(ARGV[1])      
-local tokens_per_sec = tonumber(ARGV[2])  
-local tokens_requested = 1                
-local redis_time = redis.call('TIME')
-local current_time = tonumber(redis_time[1]) + (tonumber(redis_time[2]) / 1000000)
-local bucket = redis.call('HMGET', key, 'tokens', 'last_refreshed')
-local available_tokens = tonumber(bucket[1])
-local last_refreshed = tonumber(bucket[2])
-
-if available_tokens == nil then
-    available_tokens = max_tokens
-    last_refreshed = current_time
-end
-
--- 4. Calculate how many new tokens to add based on time passed
-local time_passed = math.max(0, current_time - last_refreshed)
-local new_tokens_to_add = time_passed * tokens_per_sec
-
--- Add new tokens, but cap it at 'max_tokens' (bucket can't overflow)
-available_tokens = math.min(max_tokens, available_tokens + new_tokens_to_add)
-
--- 5. Check if we have enough tokens to allow this request
-local is_rate_limited = 1  -- Default to 1 (True = Rejected)
-
-if available_tokens >= tokens_requested then
-    -- We have enough tokens! Consume them and allow the request.
-    available_tokens = available_tokens - tokens_requested
-    is_rate_limited = 0    -- Set to 0 (False = Accepted)
-end
-
--- 6. Save the updated bucket state back to Redis
-redis.call('HMSET', key, 'tokens', available_tokens, 'last_refreshed', current_time)
-
--- 7. Set an expiration (TTL) to automatically clean up inactive keys
--- TTL = time to completely refill the bucket + 60 seconds buffer
-local ttl = 60
-if tokens_per_sec > 0 then
-    ttl = math.ceil(max_tokens / tokens_per_sec) + 60
-end
-redis.call('EXPIRE', key, ttl)
-
--- 8. Return results back to Python
--- We use math.floor to avoid returning floating point numbers to Python
-return {is_rate_limited, math.floor(available_tokens)}
-"""
 
 @dataclass
 class RateLimitResult:
@@ -62,128 +16,115 @@ class RateLimitResult:
     is_limited: bool
     current_count: int
     limit: int
-    ttl_remaining: int  # seconds until window resets
+    ttl_remaining: int  # seconds until a token is available again
 
-# In-memory fallback for when Redis is unavailable
-_fallback_cache = {}
 
 class RateLimitService:
+    """
+    Token Bucket rate limiter backed by PostgreSQL.
+
+    How it works:
+    - Each API key gets one row in the 'rate_limit_buckets' table.
+    - The row stores how many tokens are left and when it was last refilled.
+    - On every request:
+        1. Lock the row with SELECT FOR UPDATE (prevents race conditions).
+        2. Calculate how many tokens to add since the last refill.
+        3. If there is at least 1 token, consume it and allow the request.
+        4. If there are no tokens, block the request (HTTP 429).
+        5. Save the updated token count back to the database.
+    """
 
     @staticmethod
-    def _fallback_check(api_key_id: str, limit_per_minute: int) -> RateLimitResult:
-        """In-memory token bucket fallback for local dev when Redis is down."""
-        now = time.time()
-        redis_key = f"tokenbucket:{api_key_id}"
-        capacity = limit_per_minute
+    def check(api_key_id: str, limit_per_minute: int, db: Session) -> RateLimitResult:
+        # Import here to avoid circular imports at module level
+        from app.models.all_models import RateLimitBucket
+
+        capacity = float(limit_per_minute)
+        # Tokens added per second (e.g. 60/min → 1.0 token/sec)
         refill_rate = limit_per_minute / 60.0
-
-        # Cleanup old buckets to avoid memory leaks
-        keys_to_delete = []
-        for k, v in _fallback_cache.items():
-            ttl = math.ceil(capacity / refill_rate) + 60 if refill_rate > 0 else 60
-            if now - v['last_refreshed'] > ttl:
-                keys_to_delete.append(k)
-        for k in keys_to_delete:
-            del _fallback_cache[k]
-
-        if redis_key not in _fallback_cache:
-            _fallback_cache[redis_key] = {
-                'tokens': capacity,
-                'last_refreshed': now
-            }
-        
-        bucket = _fallback_cache[redis_key]
-        time_passed = max(0, now - bucket['last_refreshed'])
-        new_tokens = time_passed * refill_rate
-        
-        bucket['tokens'] = min(capacity, bucket['tokens'] + new_tokens)
-        
-        is_limited = True
-        if bucket['tokens'] >= 1:
-            bucket['tokens'] -= 1
-            is_limited = False
-            
-        bucket['last_refreshed'] = now
-
-        if is_limited:
-            ttl_remaining = max(1, int(1.0 / refill_rate)) if refill_rate > 0 else 60
-        else:
-            ttl_remaining = max(0, int((capacity - bucket['tokens']) / refill_rate)) if refill_rate > 0 else 0
-
-        return RateLimitResult(
-            is_limited=is_limited,
-            current_count=capacity - int(bucket['tokens']),
-            limit=limit_per_minute,
-            ttl_remaining=ttl_remaining,
-        )
-
-    @staticmethod
-    def check(api_key_id: str, limit_per_minute: int) -> RateLimitResult:
-        r = get_redis()
-        if not r:
-            logger.warning("Redis unavailable — using in-memory rate limiting fallback")
-            return RateLimitService._fallback_check(api_key_id, limit_per_minute)
+        now = datetime.now(timezone.utc)
 
         try:
-            # We change the key prefix to tokenbucket to avoid conflicts with old fixed-window keys
-            redis_key = f"ratelimit:tokenbucket:{api_key_id}"
-            capacity = limit_per_minute
-            refill_rate = limit_per_minute / 60.0  # Tokens replenished per second
+            # Lock this api_key's row so no other request can touch it at the same time
+            bucket = (
+                db.query(RateLimitBucket)
+                .filter(RateLimitBucket.api_key_id == api_key_id)
+                .with_for_update()   # SELECT FOR UPDATE — row-level lock
+                .first()
+            )
 
-            result = r.eval(RATE_LIMIT_LUA, 1, redis_key, capacity, refill_rate)
-            is_limited = bool(result[0])
-            tokens_remaining = int(result[1])
+            if bucket is None:
+                # First request for this key — create a full bucket and consume 1 token
+                bucket = RateLimitBucket(
+                    api_key_id=api_key_id,
+                    tokens=capacity - 1.0,       # Start full, consume 1 immediately
+                    last_refilled_at=now,
+                )
+                db.add(bucket)
+                db.commit()
 
-            # Calculate TTL for informative headers
-            if is_limited:
-                ttl_remaining = max(1, int(1.0 / refill_rate)) if refill_rate > 0 else 60
+                return RateLimitResult(
+                    is_limited=False,
+                    current_count=1,
+                    limit=limit_per_minute,
+                    ttl_remaining=0,
+                )
+
+            # Calculate how many tokens to add based on time passed since last refill
+            last_refilled = bucket.last_refilled_at
+            if last_refilled.tzinfo is None:
+                # Make naive datetime timezone-aware so subtraction works
+                last_refilled = last_refilled.replace(tzinfo=timezone.utc)
+
+            time_passed = (now - last_refilled).total_seconds()
+            time_passed = max(0.0, time_passed)
+
+            # Add tokens but never exceed the bucket capacity
+            new_tokens = time_passed * refill_rate
+            available = min(capacity, bucket.tokens + new_tokens)
+
+            if available >= 1.0:
+                # Enough tokens — allow the request
+                available -= 1.0
+                is_limited = False
+                used = int(capacity - available)
+                # Time until one more token arrives
+                ttl_remaining = 0
             else:
-                ttl_remaining = max(0, int((capacity - tokens_remaining) / refill_rate)) if refill_rate > 0 else 0
+                # Not enough tokens — block the request
+                is_limited = True
+                used = limit_per_minute
+                # Seconds until 1 token refills
+                ttl_remaining = max(1, math.ceil((1.0 - available) / refill_rate)) if refill_rate > 0 else 60
+
+            # Save updated state back to database
+            bucket.tokens = available
+            bucket.last_refilled_at = now
+            db.commit()
 
             return RateLimitResult(
                 is_limited=is_limited,
-                current_count=capacity - tokens_remaining,  # Approximate used count for compatibility
+                current_count=used,
                 limit=limit_per_minute,
                 ttl_remaining=ttl_remaining,
             )
-        except Exception as e:
-            logger.error(f"Redis rate limiting error: {e}")
-            return RateLimitService._fallback_check(api_key_id, limit_per_minute)
 
-class CacheService:
-    """
-    Small Redis caching utility for project configurations.
-    """
-
-    @staticmethod
-    def get_project_cache(project_id: str) -> dict | None:
-        r = get_redis()
-        if not r:
-            return None
-        try:
-            data = r.get(f"project_config:{project_id}")
-            if data:
-                return json.loads(data)
+        except OperationalError:
+            db.rollback()
+            logger.error("Rate limit DB error — failing open (request allowed)")
+            # If DB is down we fail open: allow the request rather than block everyone
+            return RateLimitResult(
+                is_limited=False,
+                current_count=0,
+                limit=limit_per_minute,
+                ttl_remaining=0,
+            )
         except Exception as e:
-            logger.error(f"Cache get error: {e}")
-        return None
-
-    @staticmethod
-    def set_project_cache(project_id: str, config: dict, ttl: int = 300):
-        r = get_redis()
-        if not r:
-            return
-        try:
-            r.setex(f"project_config:{project_id}", ttl, json.dumps(config))
-        except Exception as e:
-            logger.error(f"Cache set error: {e}")
-
-    @staticmethod
-    def delete_project_cache(project_id: str):
-        r = get_redis()
-        if not r:
-            return
-        try:
-            r.delete(f"project_config:{project_id}")
-        except Exception as e:
-            logger.error(f"Cache delete error: {e}")
+            db.rollback()
+            logger.error(f"Unexpected rate limit error: {e}")
+            return RateLimitResult(
+                is_limited=False,
+                current_count=0,
+                limit=limit_per_minute,
+                ttl_remaining=0,
+            )
