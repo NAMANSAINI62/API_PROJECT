@@ -635,7 +635,7 @@ export const Playground = () => {
                 {response.rateLimit && (
                   <div className="p-3 bg-[#EEF1FF] border border-[#6578B8]/30 rounded-lg text-xs space-y-1">
                     <div className="flex items-center justify-between text-[#4968A6] font-semibold text-[11px]">
-                      <span>REDIS RATE LIMIT HEADERS</span>
+                      <span>RATE LIMIT HEADERS</span>
                       <span>{response.rateLimit.remaining} / {response.rateLimit.limit} remaining</span>
                     </div>
                     <div className="w-full bg-[#D7DEE5] h-1.5 rounded-full overflow-hidden">

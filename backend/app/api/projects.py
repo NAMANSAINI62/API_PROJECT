@@ -24,7 +24,6 @@ def create_project(
         name=project_in.name,
         description=project_in.description,
         environment=project_in.environment,
-        rate_limit_per_minute=project_in.rate_limit_per_minute
     )
     db.add(project)
     db.commit()

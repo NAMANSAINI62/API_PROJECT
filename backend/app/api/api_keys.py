@@ -33,10 +33,13 @@ def get_api_keys(
 
     # Check and mark expired keys dynamically
     now = datetime.now(timezone.utc)
+    updated = False
     for key in keys:
         if key.expires_at and key.expires_at < now and key.status == "active":
             key.status = "expired"
-            db.commit()
+            updated = True
+    if updated:
+        db.commit()
 
     return keys
 

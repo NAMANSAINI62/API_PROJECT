@@ -4,6 +4,7 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
 
 const api = axios.create({
   baseURL: API_URL,
+  timeout: 60000, // 60s — allows Render free tier cold start (~50s) to complete
   headers: {
     'Content-Type': 'application/json',
   },
@@ -133,7 +134,7 @@ export const apiKeyService = {
     return res.data;
   },
   revoke: async (id) => {
-    const res = await api.patch(`/keys/${id}/revoke`);
+    const res = await api.post(`/keys/${id}/revoke`);
     return res.data;
   },
   delete: async (id) => {

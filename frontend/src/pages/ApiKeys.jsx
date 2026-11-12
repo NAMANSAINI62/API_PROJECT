@@ -66,7 +66,8 @@ export const ApiKeys = () => {
           : projectsData[0].id;
         setNewKey((prev) => ({ ...prev, project_id: prev.project_id || defaultProjId }));
       }
-    } catch {
+    } catch (err) {
+      console.error('fetchData failed:', err?.response?.status, err?.response?.data, err?.message, err);
       setError('Failed to load API keys.');
     } finally {
       setLoading(false);
