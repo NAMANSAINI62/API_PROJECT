@@ -103,7 +103,7 @@ export const projectService = {
     return res.data;
   },
   update: async (id, data) => {
-    const res = await api.patch(`/projects/${id}`, data);
+    const res = await api.put(`/projects/${id}`, data);
     return res.data;
   },
   delete: async (id) => {

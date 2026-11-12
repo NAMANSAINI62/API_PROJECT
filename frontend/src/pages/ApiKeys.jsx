@@ -5,7 +5,7 @@ import { useAuth } from '../context/AuthContext';
 import { Card, Button, Badge, Modal, Input, EmptyState, LoadingState, ErrorState, ConfirmModal, Toast } from '../components/UIComponents';
 
 export const ApiKeys = () => {
-  const { selectedProjectId } = useAuth();
+  const { selectedProjectId, setSelectedProjectId } = useAuth();
   const [keys, setKeys] = useState([]);
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
