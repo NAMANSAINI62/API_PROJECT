@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.core.database import Base, engine
 
@@ -20,10 +21,23 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
 )
 
+# Global exception handler — catches ANY unhandled error and returns a proper
+# JSON response so CORS middleware can still add its headers to it.
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
 # Custom middleware helps to wraps every request and pass it on the actual route and uu get the response. back from that request.
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        response = await call_next(request) # This sends the request to your route and waits for the response without this line routes will not run
+        try:
+            response = await call_next(request) # This sends the request to your route and waits for the response without this line routes will not run
+        except Exception:
+            # If route crashes, return a JSON error so CORS headers are still applied
+            response = JSONResponse(status_code=500, content={"detail": "Internal server error"})
         response.headers.setdefault("X-Content-Type-Options", "nosniff") # It tells the browser: "Trust the file type which i declared.
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")

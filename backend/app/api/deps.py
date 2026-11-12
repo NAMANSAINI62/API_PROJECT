@@ -56,7 +56,7 @@ def validate_gateway_api_key(raw_api_key: str, db: Session) -> tuple[APIKey, Pro
     if not api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key (key not found)")
 
-    if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
+    if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc).replace(tzinfo=None):
         if api_key.status == "active":
             api_key.status = "expired"
             db.commit()

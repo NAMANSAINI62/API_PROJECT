@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.core.security import generate_api_key
@@ -9,6 +10,10 @@ from app.models.all_models import User, Project, APIKey, APIRequestLog
 from app.schemas.schemas import APIKeyCreate, APIKeyResponse, APIKeyCreatedResponse
 
 router = APIRouter()
+
+def _utcnow_naive():
+    """Return current UTC time as a naive datetime (matches DB column type)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 @router.get("", response_model=List[APIKeyResponse])
 def get_api_keys(
@@ -19,27 +24,34 @@ def get_api_keys(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    query = db.query(APIKey).join(Project).filter(Project.user_id == current_user.id)
-    if project_id and project_id.strip():
-        query = query.filter(APIKey.project_id == project_id.strip())
-    if status:
-        query = query.filter(APIKey.status == status)
-    if environment:
-        query = query.filter(APIKey.environment == environment)
-    if search:
-        query = query.filter(APIKey.name.ilike(f"%{search}%"))
+    try:
+        query = db.query(APIKey).join(Project).filter(Project.user_id == current_user.id)
+        if project_id and project_id.strip():
+            query = query.filter(APIKey.project_id == project_id.strip())
+        if status:
+            query = query.filter(APIKey.status == status)
+        if environment:
+            query = query.filter(APIKey.environment == environment)
+        if search:
+            query = query.filter(APIKey.name.ilike(f"%{search}%"))
 
-    keys = query.order_by(APIKey.created_at.desc()).all()
+        keys = query.order_by(APIKey.created_at.desc()).all()
+    except OperationalError:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Database is temporarily unavailable. Please try again shortly.")
 
-    # Check and mark expired keys dynamically
-    now = datetime.now(timezone.utc)
-    updated = False
-    for key in keys:
-        if key.expires_at and key.expires_at < now and key.status == "active":
-            key.status = "expired"
-            updated = True
-    if updated:
-        db.commit()
+    # Check and mark expired keys dynamically (use naive datetime to match DB column)
+    try:
+        now = _utcnow_naive()
+        updated = False
+        for key in keys:
+            if key.expires_at and key.expires_at < now and key.status == "active":
+                key.status = "expired"
+                updated = True
+        if updated:
+            db.commit()
+    except Exception:
+        db.rollback()
 
     return keys
 
@@ -66,7 +78,7 @@ def create_api_key(
     exp_days = key_in.expires_in_days or key_in.expiration_days
     expires_at = None
     if exp_days:
-        expires_at = datetime.now(timezone.utc) + timedelta(days=exp_days)
+        expires_at = _utcnow_naive() + timedelta(days=exp_days)
 
     api_key = APIKey(
         project_id=project.id,
